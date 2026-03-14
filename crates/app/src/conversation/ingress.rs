@@ -1,8 +1,13 @@
 use serde_json::{Map, Value, json};
 
-const LOONGCLAW_INTERNAL_TOOL_CONTEXT_KEY: &str = "_loongclaw";
 const LOONGCLAW_INTERNAL_TOOL_INGRESS_KEY: &str = "ingress";
 const LOONGCLAW_INTERNAL_TOOL_FEISHU_CALLBACK_KEY: &str = "feishu_callback";
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct InjectedToolPayload {
+    pub payload: Value,
+    pub trusted_internal_context: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationIngressContext {
@@ -94,17 +99,26 @@ pub(crate) fn inject_internal_tool_ingress(
     tool_name: &str,
     payload: Value,
     ingress: Option<&ConversationIngressContext>,
-) -> Value {
+) -> InjectedToolPayload {
     let Some(ingress) = ingress.filter(|value| value.has_internal_tool_hints()) else {
-        return payload;
+        return InjectedToolPayload {
+            payload,
+            trusted_internal_context: false,
+        };
     };
     let canonical_name = crate::tools::canonical_tool_name(tool_name);
     if !canonical_name.starts_with("feishu.") {
-        return payload;
+        return InjectedToolPayload {
+            payload,
+            trusted_internal_context: false,
+        };
     }
 
     let Value::Object(mut body) = payload else {
-        return payload;
+        return InjectedToolPayload {
+            payload,
+            trusted_internal_context: false,
+        };
     };
     let mut internal = Map::new();
     if ingress.has_contextual_hints() {
@@ -125,13 +139,19 @@ pub(crate) fn inject_internal_tool_ingress(
         );
     }
     if internal.is_empty() {
-        return Value::Object(body);
+        return InjectedToolPayload {
+            payload: Value::Object(body),
+            trusted_internal_context: false,
+        };
     }
     body.insert(
-        LOONGCLAW_INTERNAL_TOOL_CONTEXT_KEY.to_owned(),
+        crate::tools::LOONGCLAW_INTERNAL_TOOL_CONTEXT_KEY.to_owned(),
         Value::Object(internal),
     );
-    Value::Object(body)
+    InjectedToolPayload {
+        payload: Value::Object(body),
+        trusted_internal_context: true,
+    }
 }
 
 impl ConversationIngressChannel {
@@ -371,22 +391,49 @@ mod tests {
         let untouched =
             inject_internal_tool_ingress("shell.exec", json!({"cmd": "pwd"}), Some(&ingress));
 
+        assert!(injected.trusted_internal_context);
         assert_eq!(
-            injected["_loongclaw"]["feishu_callback"]["callback_token"],
+            injected.payload["_loongclaw"]["feishu_callback"]["callback_token"],
             "callback-secret-1"
         );
         assert_eq!(
-            injected["_loongclaw"]["feishu_callback"]["operator_open_id"],
+            injected.payload["_loongclaw"]["feishu_callback"]["operator_open_id"],
             "ou_operator"
         );
         assert_eq!(
-            injected["_loongclaw"]["feishu_callback"]["deferred_context_id"],
+            injected.payload["_loongclaw"]["feishu_callback"]["deferred_context_id"],
             "evt_callback_1"
         );
         assert_eq!(
-            injected["_loongclaw"]["ingress"]["channel"]["conversation_id"],
+            injected.payload["_loongclaw"]["ingress"]["channel"]["conversation_id"],
             "oc_callback"
         );
-        assert!(untouched.get("_loongclaw").is_none());
+        assert!(!untouched.trusted_internal_context);
+        assert!(untouched.payload.get("_loongclaw").is_none());
+    }
+
+    #[test]
+    fn caller_supplied_reserved_internal_tool_context_is_not_marked_trusted() {
+        let injected = inject_internal_tool_ingress(
+            "feishu.messages.reply",
+            json!({
+                "text": "hello",
+                "_loongclaw": {
+                    "ingress": {
+                        "channel": {
+                            "platform": "feishu",
+                            "conversation_id": "oc_forged"
+                        }
+                    }
+                }
+            }),
+            None,
+        );
+
+        assert!(!injected.trusted_internal_context);
+        assert_eq!(
+            injected.payload["_loongclaw"]["ingress"]["channel"]["conversation_id"],
+            "oc_forged"
+        );
     }
 }

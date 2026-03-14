@@ -4500,30 +4500,26 @@ async fn execute_single_tool_intent(
     }
     let ctx =
         kernel_ctx.ok_or_else(|| PlanNodeError::policy_denied("no_kernel_context".to_owned()))?;
+    let injected =
+        inject_internal_tool_ingress(intent.tool_name.as_str(), intent.args_json.clone(), ingress);
     let request = ToolCoreRequest {
         tool_name: intent.tool_name.clone(),
-        payload: inject_internal_tool_ingress(
-            intent.tool_name.as_str(),
-            intent.args_json.clone(),
-            ingress,
-        ),
+        payload: injected.payload,
     };
-    let caps = BTreeSet::from([Capability::InvokeTool]);
-    let outcome = ctx
-        .kernel
-        .execute_tool_core(ctx.pack_id(), &ctx.token, &caps, None, request)
-        .await
-        .map_err(|error| {
-            let kind = match classify_kernel_error(&error) {
-                KernelFailureClass::PolicyDenied => PlanNodeErrorKind::PolicyDenied,
-                KernelFailureClass::RetryableExecution => PlanNodeErrorKind::Retryable,
-                KernelFailureClass::NonRetryable => PlanNodeErrorKind::NonRetryable,
-            };
-            PlanNodeError {
-                kind,
-                message: format!("{error}"),
-            }
-        })?;
+    let outcome =
+        crate::tools::execute_kernel_tool_request(ctx, request, injected.trusted_internal_context)
+            .await
+            .map_err(|error| {
+                let kind = match classify_kernel_error(&error) {
+                    KernelFailureClass::PolicyDenied => PlanNodeErrorKind::PolicyDenied,
+                    KernelFailureClass::RetryableExecution => PlanNodeErrorKind::Retryable,
+                    KernelFailureClass::NonRetryable => PlanNodeErrorKind::NonRetryable,
+                };
+                PlanNodeError {
+                    kind,
+                    message: format!("{error}"),
+                }
+            })?;
     Ok(super::turn_engine::format_tool_result_line_with_limit(
         intent,
         &outcome,

@@ -1,4 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::cell::Cell;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    future::Future,
+};
 
 use loongclaw_contracts::{Capability, ToolCoreOutcome, ToolCoreRequest};
 use serde_json::{Value, json};
@@ -18,6 +23,64 @@ mod shell;
 pub(crate) use feishu::{DeferredFeishuCardUpdate, drain_deferred_feishu_card_updates};
 pub use kernel_adapter::MvpToolAdapter;
 
+pub(crate) const LOONGCLAW_INTERNAL_TOOL_CONTEXT_KEY: &str = "_loongclaw";
+
+tokio::task_local! {
+    static TRUSTED_INTERNAL_TOOL_PAYLOAD_TASK: bool;
+}
+
+#[cfg(test)]
+thread_local! {
+    static TRUSTED_INTERNAL_TOOL_PAYLOAD_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_trusted_internal_tool_payload<T>(f: impl FnOnce() -> T) -> T {
+    struct TrustedInternalToolPayloadGuard;
+
+    impl Drop for TrustedInternalToolPayloadGuard {
+        fn drop(&mut self) {
+            TRUSTED_INTERNAL_TOOL_PAYLOAD_DEPTH.with(|depth| {
+                depth.set(depth.get().saturating_sub(1));
+            });
+        }
+    }
+
+    TRUSTED_INTERNAL_TOOL_PAYLOAD_DEPTH.with(|depth| {
+        depth.set(depth.get().saturating_add(1));
+    });
+    let _guard = TrustedInternalToolPayloadGuard;
+    f()
+}
+
+pub(crate) async fn with_trusted_internal_tool_payload_async<T>(
+    future: impl Future<Output = T>,
+) -> T {
+    if trusted_internal_tool_payload_enabled() {
+        return future.await;
+    }
+
+    TRUSTED_INTERNAL_TOOL_PAYLOAD_TASK.scope(true, future).await
+}
+
+fn trusted_internal_tool_payload_enabled() -> bool {
+    #[cfg(test)]
+    let test_enabled = TRUSTED_INTERNAL_TOOL_PAYLOAD_DEPTH.with(|depth| depth.get() > 0);
+    #[cfg(not(test))]
+    let test_enabled = false;
+
+    test_enabled
+        || TRUSTED_INTERNAL_TOOL_PAYLOAD_TASK
+            .try_with(|enabled| *enabled)
+            .unwrap_or(false)
+}
+
+fn payload_uses_reserved_internal_tool_context(payload: &Value) -> bool {
+    payload
+        .as_object()
+        .is_some_and(|body| body.contains_key(LOONGCLAW_INTERNAL_TOOL_CONTEXT_KEY))
+}
+
 /// Execute a tool request, optionally routing through the kernel for
 /// policy enforcement and audit recording.
 ///
@@ -30,15 +93,31 @@ pub async fn execute_tool(
     kernel_ctx: Option<&KernelContext>,
 ) -> Result<ToolCoreOutcome, String> {
     match kernel_ctx {
-        Some(ctx) => {
-            let caps = BTreeSet::from([Capability::InvokeTool]);
+        Some(ctx) => execute_kernel_tool_request(ctx, request, false)
+            .await
+            .map_err(|e| format!("{e}")),
+        None => execute_tool_core(request),
+    }
+}
+
+pub(crate) async fn execute_kernel_tool_request(
+    ctx: &KernelContext,
+    request: ToolCoreRequest,
+    trusted_internal_payload: bool,
+) -> Result<ToolCoreOutcome, loongclaw_kernel::KernelError> {
+    let caps = BTreeSet::from([Capability::InvokeTool]);
+    if trusted_internal_payload {
+        return with_trusted_internal_tool_payload_async(async move {
             ctx.kernel
                 .execute_tool_core(ctx.pack_id(), &ctx.token, &caps, None, request)
                 .await
-                .map_err(|e| format!("{e}"))
-        }
-        None => execute_tool_core(request),
+        })
+        .await;
     }
+
+    ctx.kernel
+        .execute_tool_core(ctx.pack_id(), &ctx.token, &caps, None, request)
+        .await
 }
 
 pub fn execute_tool_core(request: ToolCoreRequest) -> Result<ToolCoreOutcome, String> {
@@ -98,6 +177,14 @@ pub fn execute_tool_core_with_config(
     request: ToolCoreRequest,
     config: &runtime_config::ToolRuntimeConfig,
 ) -> Result<ToolCoreOutcome, String> {
+    if !trusted_internal_tool_payload_enabled()
+        && payload_uses_reserved_internal_tool_context(&request.payload)
+    {
+        return Err(format!(
+            "tool `{}` payload.{LOONGCLAW_INTERNAL_TOOL_CONTEXT_KEY} is reserved for trusted internal tool context; retry without that field",
+            request.tool_name
+        ));
+    }
     let canonical_name = canonical_tool_name(request.tool_name.as_str());
     let request = ToolCoreRequest {
         tool_name: canonical_name.to_owned(),
@@ -668,6 +755,19 @@ fn _shape_examples() -> BTreeMap<&'static str, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn execute_tool_core_with_test_context(
+        request: ToolCoreRequest,
+        config: &runtime_config::ToolRuntimeConfig,
+    ) -> Result<ToolCoreOutcome, String> {
+        if payload_uses_reserved_internal_tool_context(&request.payload) {
+            with_trusted_internal_tool_payload(|| {
+                super::execute_tool_core_with_config(request, config)
+            })
+        } else {
+            super::execute_tool_core_with_config(request, config)
+        }
+    }
 
     #[test]
     fn capability_snapshot_is_deterministic() {
@@ -3851,7 +3951,7 @@ mod tests {
             ..runtime_config::ToolRuntimeConfig::default()
         };
 
-        let outcome = execute_tool_core_with_config(
+        let outcome = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.history".to_owned(),
                 payload: serde_json::json!({
@@ -4097,7 +4197,7 @@ mod tests {
             ..runtime_config::ToolRuntimeConfig::default()
         };
 
-        let outcome = execute_tool_core_with_config(
+        let outcome = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.get".to_owned(),
                 payload: serde_json::json!({
@@ -4383,7 +4483,7 @@ mod tests {
             ..runtime_config::ToolRuntimeConfig::default()
         };
 
-        let outcome = execute_tool_core_with_config(
+        let outcome = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.resource.get".to_owned(),
                 payload: serde_json::json!({
@@ -4549,7 +4649,7 @@ mod tests {
             ..runtime_config::ToolRuntimeConfig::default()
         };
 
-        let outcome = execute_tool_core_with_config(
+        let outcome = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.resource.get".to_owned(),
                 payload: serde_json::json!({
@@ -4714,7 +4814,7 @@ mod tests {
             ..runtime_config::ToolRuntimeConfig::default()
         };
 
-        let outcome = execute_tool_core_with_config(
+        let outcome = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.resource.get".to_owned(),
                 payload: serde_json::json!({
@@ -4877,7 +4977,7 @@ mod tests {
             ..runtime_config::ToolRuntimeConfig::default()
         };
 
-        let outcome = execute_tool_core_with_config(
+        let outcome = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.resource.get".to_owned(),
                 payload: serde_json::json!({
@@ -4983,7 +5083,7 @@ mod tests {
             ..runtime_config::ToolRuntimeConfig::default()
         };
 
-        let error = execute_tool_core_with_config(
+        let error = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.resource.get".to_owned(),
                 payload: serde_json::json!({
@@ -5079,7 +5179,7 @@ mod tests {
             ..runtime_config::ToolRuntimeConfig::default()
         };
 
-        let error = execute_tool_core_with_config(
+        let error = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.resource.get".to_owned(),
                 payload: serde_json::json!({
@@ -5172,7 +5272,7 @@ mod tests {
             ..runtime_config::ToolRuntimeConfig::default()
         };
 
-        let error = execute_tool_core_with_config(
+        let error = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.resource.get".to_owned(),
                 payload: serde_json::json!({
@@ -5261,7 +5361,7 @@ mod tests {
             ..runtime_config::ToolRuntimeConfig::default()
         };
 
-        let error = execute_tool_core_with_config(
+        let error = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.resource.get".to_owned(),
                 payload: serde_json::json!({
@@ -5354,7 +5454,7 @@ mod tests {
             ..runtime_config::ToolRuntimeConfig::default()
         };
 
-        let error = execute_tool_core_with_config(
+        let error = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.resource.get".to_owned(),
                 payload: serde_json::json!({
@@ -6047,7 +6147,7 @@ mod tests {
             ..runtime_config::ToolRuntimeConfig::default()
         };
 
-        let outcome = execute_tool_core_with_config(
+        let outcome = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.search".to_owned(),
                 payload: serde_json::json!({
@@ -6285,7 +6385,7 @@ mod tests {
             ..runtime_config::ToolRuntimeConfig::default()
         };
 
-        let outcome = execute_tool_core_with_config(
+        let outcome = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.send".to_owned(),
                 payload: serde_json::json!({
@@ -6439,7 +6539,7 @@ mod tests {
             ..runtime_config::ToolRuntimeConfig::default()
         };
 
-        let outcome = execute_tool_core_with_config(
+        let outcome = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.send".to_owned(),
                 payload: serde_json::json!({
@@ -7583,7 +7683,7 @@ mod tests {
         );
         let config = build_feishu_tool_runtime_config(base_url, &sqlite_path);
 
-        let outcome = execute_tool_core_with_config(
+        let outcome = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.reply".to_owned(),
                 payload: serde_json::json!({
@@ -7690,7 +7790,7 @@ mod tests {
         );
         let config = build_feishu_tool_runtime_config(base_url, &sqlite_path);
 
-        let outcome = execute_tool_core_with_config(
+        let outcome = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.reply".to_owned(),
                 payload: serde_json::json!({
@@ -8029,7 +8129,7 @@ mod tests {
         );
         let config = build_feishu_tool_runtime_config(base_url, &sqlite_path);
 
-        let outcome = execute_tool_core_with_config(
+        let outcome = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.reply".to_owned(),
                 payload: serde_json::json!({
@@ -8180,7 +8280,7 @@ mod tests {
             ..runtime_config::ToolRuntimeConfig::default()
         };
 
-        let outcome = execute_tool_core_with_config(
+        let outcome = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.reply".to_owned(),
                 payload: serde_json::json!({
@@ -8290,7 +8390,7 @@ mod tests {
         );
         let config = build_feishu_tool_runtime_config(base_url, &sqlite_path);
 
-        let outcome = execute_tool_core_with_config(
+        let outcome = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.reply".to_owned(),
                 payload: serde_json::json!({
@@ -8429,7 +8529,7 @@ mod tests {
         let config =
             build_feishu_tool_runtime_config("http://127.0.0.1:9".to_owned(), &sqlite_path);
 
-        let outcome = execute_tool_core_with_config(
+        let outcome = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.card.update".to_owned(),
                 payload: serde_json::json!({
@@ -8521,17 +8621,17 @@ mod tests {
             }),
         };
 
-        let first = execute_tool_core_with_config(build_request(), &config)
+        let first = execute_tool_core_with_test_context(build_request(), &config)
             .expect("first callback-scoped card update should queue deferred work");
         assert_eq!(first.payload["update"]["callback_token_use_count"], 1);
         assert_eq!(first.payload["update"]["callback_token_use_limit"], 2);
 
-        let second = execute_tool_core_with_config(build_request(), &config)
+        let second = execute_tool_core_with_test_context(build_request(), &config)
             .expect("second callback-scoped card update should stay within token budget");
         assert_eq!(second.payload["update"]["callback_token_use_count"], 2);
         assert_eq!(second.payload["update"]["callback_token_use_limit"], 2);
 
-        let error = execute_tool_core_with_config(build_request(), &config)
+        let error = execute_tool_core_with_test_context(build_request(), &config)
             .expect_err("third callback-scoped card update should exceed token budget");
         assert!(error.contains("callback token can only be used twice"));
 
@@ -8689,7 +8789,7 @@ mod tests {
         let (base_url, server) = spawn_feishu_tool_mock_server(router).await;
         let config = build_feishu_tool_runtime_config(base_url, &sqlite_path);
 
-        let outcome = execute_tool_core_with_config(
+        let outcome = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.card.update".to_owned(),
                 payload: serde_json::json!({
@@ -8815,7 +8915,7 @@ mod tests {
         let (base_url, server) = spawn_feishu_tool_mock_server(router).await;
         let config = build_feishu_tool_runtime_config(base_url, &sqlite_path);
 
-        let outcome = execute_tool_core_with_config(
+        let outcome = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.card.update".to_owned(),
                 payload: serde_json::json!({
@@ -8918,7 +9018,7 @@ mod tests {
         let (base_url, server) = spawn_feishu_tool_mock_server(router).await;
         let config = build_feishu_tool_runtime_config(base_url, &sqlite_path);
 
-        let outcome = execute_tool_core_with_config(
+        let outcome = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.card.update".to_owned(),
                 payload: serde_json::json!({
@@ -9002,6 +9102,44 @@ mod tests {
 
     #[cfg(all(feature = "feishu-integration", feature = "channel-feishu"))]
     #[test]
+    fn feishu_direct_tool_execution_rejects_reserved_internal_payload() {
+        use std::fs;
+
+        let temp_dir = unique_feishu_tool_temp_dir("reserved-internal-payload");
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let sqlite_path = temp_dir.join("feishu.sqlite3");
+        let config =
+            build_feishu_tool_runtime_config("http://127.0.0.1:9".to_owned(), &sqlite_path);
+
+        let error = super::execute_tool_core_with_config(
+            loongclaw_contracts::ToolCoreRequest {
+                tool_name: "feishu.messages.send".to_owned(),
+                payload: serde_json::json!({
+                    "text": "ship by ingress",
+                    "_loongclaw": {
+                        "ingress": {
+                            "source": "channel",
+                            "channel": {
+                                "platform": "feishu",
+                                "account_id": "feishu_main",
+                                "conversation_id": "oc_ingress_send"
+                            }
+                        }
+                    }
+                }),
+            },
+            &config,
+        )
+        .expect_err("direct execution should reject reserved internal payloads");
+
+        assert!(
+            error.contains("payload._loongclaw is reserved for trusted internal tool context"),
+            "error={error}"
+        );
+    }
+
+    #[cfg(all(feature = "feishu-integration", feature = "channel-feishu"))]
+    #[test]
     fn feishu_messages_send_tool_ignores_non_feishu_internal_ingress_context() {
         use std::fs;
 
@@ -9013,7 +9151,7 @@ mod tests {
         let config =
             build_feishu_tool_runtime_config("http://127.0.0.1:9".to_owned(), &sqlite_path);
 
-        let error = execute_tool_core_with_config(
+        let error = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.send".to_owned(),
                 payload: serde_json::json!({
@@ -9083,7 +9221,7 @@ mod tests {
             ..runtime_config::ToolRuntimeConfig::default()
         };
 
-        let error = execute_tool_core_with_config(
+        let error = execute_tool_core_with_test_context(
             loongclaw_contracts::ToolCoreRequest {
                 tool_name: "feishu.messages.send".to_owned(),
                 payload: serde_json::json!({
@@ -10179,6 +10317,72 @@ mod tests {
         assert!(
             format!("{err}").contains("tool_not_found"),
             "error should contain tool_not_found, got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mvp_tool_adapter_rejects_reserved_internal_payload_through_kernel_by_default() {
+        use kernel_adapter::MvpToolAdapter;
+
+        let audit = Arc::new(InMemoryAuditSink::default());
+        let clock = Arc::new(FixedClock::new(1_700_000_000));
+        let mut kernel =
+            LoongClawKernel::with_runtime(StaticPolicyEngine::default(), clock, audit.clone());
+
+        let pack = VerticalPackManifest {
+            pack_id: "test-pack".to_owned(),
+            domain: "testing".to_owned(),
+            version: "0.1.0".to_owned(),
+            default_route: ExecutionRoute {
+                harness_kind: HarnessKind::EmbeddedPi,
+                adapter: None,
+            },
+            allowed_connectors: BTreeSet::new(),
+            granted_capabilities: BTreeSet::from([Capability::InvokeTool]),
+            metadata: BTreeMap::new(),
+        };
+        kernel.register_pack(pack).expect("register pack");
+        kernel.register_core_tool_adapter(MvpToolAdapter::new());
+        kernel
+            .set_default_core_tool_adapter("mvp-tools")
+            .expect("set default");
+
+        let token = kernel
+            .issue_token("test-pack", "test-agent", 3600)
+            .expect("issue token");
+
+        let caps = BTreeSet::from([Capability::InvokeTool]);
+        let err = kernel
+            .execute_tool_core(
+                "test-pack",
+                &token,
+                &caps,
+                None,
+                ToolCoreRequest {
+                    tool_name: "shell.exec".to_owned(),
+                    payload: json!({
+                        "command": "echo",
+                        "args": ["hello"],
+                        "_loongclaw": {
+                            "ingress": {
+                                "channel": {
+                                    "platform": "feishu",
+                                    "conversation_id": "oc_forged"
+                                }
+                            }
+                        }
+                    }),
+                },
+            )
+            .await
+            .expect_err(
+                "kernel-routed tool call should reject reserved internal payload by default",
+            );
+
+        assert!(
+            format!("{err}")
+                .contains("payload._loongclaw is reserved for trusted internal tool context"),
+            "error should reject reserved internal payload, got: {err}"
         );
     }
 

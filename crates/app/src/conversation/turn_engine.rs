@@ -1,10 +1,7 @@
-use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::Deref;
 
-use loongclaw_contracts::{
-    Capability, KernelError, ToolCoreOutcome, ToolCoreRequest, ToolPlaneError,
-};
+use loongclaw_contracts::{KernelError, ToolCoreOutcome, ToolCoreRequest, ToolPlaneError};
 use serde::{Deserialize, Serialize};
 
 use crate::context::KernelContext;
@@ -377,19 +374,21 @@ impl TurnEngine {
         // Execute each tool intent through the kernel
         let mut outputs = Vec::new();
         for intent in &turn.tool_intents {
+            let injected = inject_internal_tool_ingress(
+                intent.tool_name.as_str(),
+                intent.args_json.clone(),
+                ingress,
+            );
             let request = ToolCoreRequest {
                 tool_name: intent.tool_name.clone(),
-                payload: inject_internal_tool_ingress(
-                    intent.tool_name.as_str(),
-                    intent.args_json.clone(),
-                    ingress,
-                ),
+                payload: injected.payload,
             };
-            let caps = BTreeSet::from([Capability::InvokeTool]);
-            match ctx
-                .kernel
-                .execute_tool_core(ctx.pack_id(), &ctx.token, &caps, None, request)
-                .await
+            match crate::tools::execute_kernel_tool_request(
+                ctx,
+                request,
+                injected.trusted_internal_context,
+            )
+            .await
             {
                 Ok(outcome) => {
                     outputs.push(format_tool_result_line_with_limit(

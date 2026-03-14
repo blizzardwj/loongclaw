@@ -271,6 +271,14 @@ impl HttpBody for FeishuPostResponseJsonBody {
     }
 }
 
+impl Drop for FeishuPostResponseJsonBody {
+    fn drop(&mut self) {
+        if let Some(dispatch) = self.post_response_dispatch.take() {
+            dispatch.spawn();
+        }
+    }
+}
+
 impl RecentIdCache {
     fn new(max_len: usize) -> Self {
         Self {
@@ -2360,6 +2368,105 @@ mod tests {
             delayed_update
                 .body
                 .contains("\"token\":\"callback-token-response-order\"")
+        );
+        assert!(
+            delayed_update
+                .body
+                .contains("\"content\":\"callback updated\"")
+        );
+        assert!(
+            !provider_requests.is_empty(),
+            "callback processing should still reach the provider before deferred dispatch"
+        );
+
+        provider_server.abort();
+        feishu_server.abort();
+    }
+
+    #[tokio::test]
+    async fn feishu_webhook_card_callback_delayed_update_dispatches_when_response_body_is_dropped()
+    {
+        let provider_requests = Arc::new(Mutex::new(Vec::<MockRequest>::new()));
+        let feishu_requests = Arc::new(Mutex::new(Vec::<MockRequest>::new()));
+        let (provider_base_url, provider_server) =
+            spawn_mock_provider_card_update_server(provider_requests.clone()).await;
+        let (feishu_base_url, feishu_server) =
+            spawn_mock_feishu_api_server(feishu_requests.clone(), "om_reply_unused").await;
+
+        let config = test_webhook_config(&provider_base_url, &feishu_base_url);
+        let resolved = config
+            .feishu
+            .resolve_account(None)
+            .expect("resolve feishu account");
+        let adapter = FeishuAdapter::new(&resolved).expect("build feishu adapter");
+        let kernel_ctx = bootstrap_webhook_kernel_context(
+            "feishu-webhook-card-callback-delayed-update-response-drop",
+            DEFAULT_TOKEN_TTL_S,
+            &config,
+        )
+        .expect("bootstrap kernel context");
+        let runtime = Arc::new(
+            ChannelOperationRuntimeTracker::start(
+                ChannelPlatform::Feishu,
+                "serve",
+                resolved.account.id.as_str(),
+                resolved.account.label.as_str(),
+            )
+            .await
+            .expect("start runtime tracker"),
+        );
+        let state = FeishuWebhookState::new(config, &resolved, adapter, kernel_ctx, runtime);
+
+        let payload = json!({
+            "header": {
+                "event_id": "evt_card_webhook_response_drop_1",
+                "event_type": "card.action.trigger",
+                "token": "verify-token"
+            },
+            "event": {
+                "token": "callback-token-response-drop",
+                "operator": {
+                    "operator_id": {
+                        "open_id": "ou_sender_1"
+                    }
+                },
+                "action": {
+                    "tag": "button",
+                    "name": "approve_request"
+                },
+                "context": {
+                    "open_message_id": "om_card_source_response_drop",
+                    "open_chat_id": "oc_demo"
+                }
+            }
+        });
+        let raw_body = serde_json::to_string(&payload).expect("serialize payload");
+        let headers = signed_headers(&raw_body, "encrypt-key");
+
+        let response = feishu_webhook_handler(State(state), headers, Bytes::from(raw_body.clone()))
+            .await
+            .into_response();
+        drop(response);
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let feishu_requests = feishu_requests.lock().await.clone();
+        let provider_requests = provider_requests.lock().await.clone();
+        let delayed_update = feishu_requests
+            .iter()
+            .find(|request| request.path == "/open-apis/interactive/v1/card/update")
+            .unwrap_or_else(|| {
+                panic!(
+                    "delayed update request after response drop; feishu_requests={feishu_requests:?}; provider_requests={provider_requests:?}"
+                )
+            });
+        assert_eq!(
+            delayed_update.authorization.as_deref(),
+            Some("Bearer t-token-webhook")
+        );
+        assert!(
+            delayed_update
+                .body
+                .contains("\"token\":\"callback-token-response-drop\"")
         );
         assert!(
             delayed_update
