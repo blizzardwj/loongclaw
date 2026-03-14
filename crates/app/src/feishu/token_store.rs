@@ -4,12 +4,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::CliResult;
 
 use super::principal::{FeishuGrantScopeSet, FeishuUserPrincipal};
+
+const FEISHU_TOKEN_DB_BUSY_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeishuGrant {
@@ -343,9 +345,12 @@ impl FeishuTokenStore {
         now_s: i64,
     ) -> CliResult<FeishuStoredOauthState> {
         ensure_feishu_schema(&self.path)?;
-        let conn = open_connection(&self.path)?;
+        let mut conn = open_connection(&self.path)?;
         let state_key = state.trim();
-        let record = conn
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("begin feishu oauth state transaction failed: {error}"))?;
+        let record = tx
             .query_row(
                 "SELECT
                     account_id,
@@ -375,11 +380,13 @@ impl FeishuTokenStore {
             .map_err(|error| format!("load feishu oauth state failed: {error}"))?
             .ok_or_else(|| "feishu oauth state was not found".to_owned())?;
 
-        conn.execute(
+        tx.execute(
             "DELETE FROM feishu_oauth_states WHERE state = ?1",
             params![state_key],
         )
         .map_err(|error| format!("delete feishu oauth state failed: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("commit feishu oauth state transaction failed: {error}"))?;
 
         if record.expires_at_s <= now_s {
             return Err("feishu oauth state expired".to_owned());
@@ -389,16 +396,26 @@ impl FeishuTokenStore {
     }
 }
 
-fn open_connection(path: &PathBuf) -> CliResult<Connection> {
-    Connection::open(path).map_err(|error| format!("open feishu token db failed: {error}"))
+fn open_connection(path: &Path) -> CliResult<Connection> {
+    let conn =
+        Connection::open(path).map_err(|error| format!("open feishu token db failed: {error}"))?;
+    conn.busy_timeout(std::time::Duration::from_millis(
+        FEISHU_TOKEN_DB_BUSY_TIMEOUT_MS,
+    ))
+    .map_err(|error| format!("configure feishu token db busy timeout failed: {error}"))?;
+    Ok(conn)
 }
 
-fn ensure_feishu_schema(path: &PathBuf) -> CliResult<()> {
+fn ensure_feishu_schema(path: &Path) -> CliResult<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
+        let created_parent = !parent.exists();
         fs::create_dir_all(parent)
             .map_err(|error| format!("create feishu token db directory failed: {error}"))?;
+        if created_parent {
+            harden_feishu_token_store_parent_dir(parent)?;
+        }
     }
 
     let conn = open_connection(path)?;
@@ -434,6 +451,65 @@ fn ensure_feishu_schema(path: &PathBuf) -> CliResult<()> {
         );",
     )
     .map_err(|error| format!("initialize feishu token schema failed: {error}"))?;
+    harden_feishu_token_store_file_permissions(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_feishu_token_store_parent_dir(path: &Path) -> CliResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| {
+            format!(
+                "read feishu token db directory metadata `{}` failed: {error}",
+                path.display()
+            )
+        })?
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(path, permissions).map_err(|error| {
+        format!(
+            "set feishu token db directory permissions `{}` failed: {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn harden_feishu_token_store_parent_dir(_path: &Path) -> CliResult<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_feishu_token_store_file_permissions(path: &Path) -> CliResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if path.as_os_str().is_empty() || path == Path::new(":memory:") || !path.exists() {
+        return Ok(());
+    }
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| {
+            format!(
+                "read feishu token db metadata `{}` failed: {error}",
+                path.display()
+            )
+        })?
+        .permissions();
+    permissions.set_mode(0o600);
+    fs::set_permissions(path, permissions).map_err(|error| {
+        format!(
+            "set feishu token db permissions `{}` failed: {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn harden_feishu_token_store_file_permissions(_path: &Path) -> CliResult<()> {
     Ok(())
 }
 
@@ -468,6 +544,7 @@ fn unix_ts_now() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -546,6 +623,61 @@ mod tests {
         let result = store.consume_oauth_state("state-1", 11);
 
         assert!(matches!(result, Err(error) if error.contains("expired")));
+    }
+
+    #[test]
+    fn token_store_oauth_state_is_single_use() {
+        let path = unique_temp_db("oauth-state-single-use");
+        let store = FeishuTokenStore::new(path);
+        store
+            .save_oauth_state("state-1", "feishu_main", "ou_123", 1_700_000_100)
+            .expect("save oauth state");
+
+        let consumed = store
+            .consume_oauth_state("state-1", 1_700_000_000)
+            .expect("consume oauth state");
+        assert_eq!(consumed.state, "state-1");
+        assert_eq!(consumed.account_id, "feishu_main");
+
+        let second = store.consume_oauth_state("state-1", 1_700_000_000);
+        assert!(matches!(second, Err(error) if error.contains("not found")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_store_hardens_secret_db_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "feishu-token-store-perms-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before epoch")
+                .as_nanos()
+        ));
+        let path = temp_dir.join("private").join("feishu.sqlite3");
+        let store = FeishuTokenStore::new(path.clone());
+
+        store
+            .save_oauth_state("state-1", "feishu_main", "ou_123", 1_700_000_100)
+            .expect("save oauth state");
+
+        let parent_mode = fs::metadata(path.parent().expect("sqlite parent"))
+            .expect("read sqlite parent metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = fs::metadata(&path)
+            .expect("read sqlite file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        assert_eq!(parent_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
