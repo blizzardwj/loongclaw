@@ -4208,11 +4208,6 @@ mod tests {
             "preflight should surface transport review before writing a Responses-compatible config: {checks:#?}"
         );
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[test]
     fn format_backup_timestamp_at_matches_existing_filename_shape() {
