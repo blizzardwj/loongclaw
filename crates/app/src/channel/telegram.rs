@@ -253,6 +253,46 @@ impl TelegramAdapter {
     }
 }
 
+pub(super) async fn run_telegram_send(
+    config: &ResolvedTelegramChannelConfig,
+    token: String,
+    target_kind: ChannelOutboundTargetKind,
+    target_id: &str,
+    text: &str,
+) -> CliResult<()> {
+    let adapter = TelegramAdapter::new(config, token);
+    let target = build_telegram_send_target(target_kind, target_id)?;
+    adapter.send_text(&target, text).await
+}
+
+fn build_telegram_send_target(
+    target_kind: ChannelOutboundTargetKind,
+    target_id: &str,
+) -> CliResult<ChannelOutboundTarget> {
+    if target_kind != ChannelOutboundTargetKind::Conversation {
+        return Err(format!(
+            "telegram send requires conversation target kind, got {}",
+            target_kind.as_str()
+        ));
+    }
+
+    let trimmed_target_id = target_id.trim();
+    if trimmed_target_id.is_empty() {
+        return Err("telegram outbound target id is empty".to_owned());
+    }
+
+    let parsed_target = ChannelOutboundTarget::new(
+        ChannelPlatform::Telegram,
+        ChannelOutboundTargetKind::Conversation,
+        trimmed_target_id,
+    );
+    let (chat_id, thread_id) = parse_telegram_conversation_target(&parsed_target)?;
+    Ok(match telegram_forum_topic_id(thread_id) {
+        Some(thread_id) => ChannelOutboundTarget::telegram_chat_thread(chat_id, thread_id),
+        None => ChannelOutboundTarget::telegram_chat(chat_id),
+    })
+}
+
 impl Drop for TelegramAdapter {
     fn drop(&mut self) {
         self.abort_all_typing_handles();
@@ -597,6 +637,79 @@ mod tests {
         assert_eq!(inbox[0].text, "topic hello");
         assert_eq!(inbox[0].delivery.ack_cursor.as_deref(), Some("101"));
         assert_eq!(next_offset, Some(101));
+    }
+
+    #[test]
+    fn parse_telegram_conversation_target_supports_chat_and_topic_ids() {
+        let chat_only = ChannelOutboundTarget::telegram_chat(123);
+        let topic = ChannelOutboundTarget::telegram_chat_thread(123, 7);
+
+        assert_eq!(
+            parse_telegram_conversation_target(&chat_only).expect("chat target"),
+            (123, None)
+        );
+        assert_eq!(
+            parse_telegram_conversation_target(&topic).expect("topic target"),
+            (123, Some(7))
+        );
+    }
+
+    #[test]
+    fn build_telegram_send_target_supports_chat_and_topic_ids() {
+        let chat_only =
+            build_telegram_send_target(ChannelOutboundTargetKind::Conversation, " 123 ")
+                .expect("chat target");
+        let topic =
+            build_telegram_send_target(ChannelOutboundTargetKind::Conversation, " 123:topic:7 ")
+                .expect("topic target");
+
+        assert_eq!(chat_only, ChannelOutboundTarget::telegram_chat(123));
+        assert_eq!(topic, ChannelOutboundTarget::telegram_chat_thread(123, 7));
+    }
+
+    #[test]
+    fn build_telegram_send_target_rejects_non_conversation_target_kinds() {
+        assert_eq!(
+            build_telegram_send_target(ChannelOutboundTargetKind::MessageReply, "om_123")
+                .expect_err("message reply targets should be rejected"),
+            "telegram send requires conversation target kind, got message_reply"
+        );
+    }
+
+    #[test]
+    fn telegram_thread_helpers_drop_general_topic_and_non_forum_context() {
+        assert_eq!(
+            telegram_forum_topic_id(Some(TELEGRAM_GENERAL_TOPIC_ID)),
+            None
+        );
+        assert_eq!(telegram_forum_topic_id(Some(7)), Some(7));
+
+        let forum_message = json!({
+            "chat": {"id": 123, "is_forum": true},
+            "message_thread_id": TELEGRAM_GENERAL_TOPIC_ID,
+        });
+        let non_forum_message = json!({
+            "chat": {"id": 123, "is_forum": false},
+            "message_thread_id": 7,
+        });
+
+        assert_eq!(telegram_inbound_thread_id(&forum_message), None);
+        assert_eq!(telegram_inbound_thread_id(&non_forum_message), None);
+    }
+
+    #[test]
+    fn insert_telegram_thread_id_omits_general_topic_targets() {
+        let mut general_topic_body = json!({
+            "chat_id": 123,
+            "action": "typing",
+        });
+        let mut forum_topic_body = general_topic_body.clone();
+
+        insert_telegram_thread_id(&mut general_topic_body, Some(TELEGRAM_GENERAL_TOPIC_ID));
+        insert_telegram_thread_id(&mut forum_topic_body, Some(7));
+
+        assert_eq!(general_topic_body.get("message_thread_id"), None);
+        assert_eq!(forum_topic_body.get("message_thread_id"), Some(&json!(7)));
     }
 
     #[tokio::test]
