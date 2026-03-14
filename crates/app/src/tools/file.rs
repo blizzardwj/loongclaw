@@ -274,6 +274,7 @@ mod tests {
         let config = ToolRuntimeConfig {
             shell_allowlist: Default::default(),
             file_root: Some(root),
+            config_path: None,
             external_skills: Default::default(),
         };
         let error =
@@ -298,6 +299,7 @@ mod tests {
         let config = ToolRuntimeConfig {
             shell_allowlist: Default::default(),
             file_root: Some(root),
+            config_path: None,
             external_skills: Default::default(),
         };
         let request = ToolCoreRequest {
@@ -324,6 +326,7 @@ mod tests {
         let config = ToolRuntimeConfig {
             shell_allowlist: Default::default(),
             file_root: Some(root.clone()),
+            config_path: None,
             external_skills: Default::default(),
         };
         let request = ToolCoreRequest {

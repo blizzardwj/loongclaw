@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use serde_json::{Value, json};
 use tokio::time::sleep;
@@ -6,7 +6,8 @@ use tokio::time::sleep;
 use crate::{CliResult, KernelContext};
 
 use super::config::{
-    LoongClawConfig, ProviderConfig, ProviderKind, ProviderWireApi, ReasoningEffort,
+    LoongClawConfig, PROVIDER_SELECTOR_TARGET_SUMMARY, ProviderConfig, ProviderKind,
+    ProviderSelectorProfileRef, ProviderWireApi, ReasoningEffort, accepted_provider_selectors,
 };
 #[cfg(feature = "memory-sqlite")]
 use super::memory;
@@ -24,16 +25,9 @@ pub fn build_system_message(
     if !include_system_prompt {
         return None;
     }
-    let system = config.cli.system_prompt.trim();
-    let snapshot = super::tools::capability_snapshot();
-    let content = if system.is_empty() {
-        snapshot
-    } else {
-        format!("{system}\n\n{snapshot}")
-    };
     Some(json!({
         "role": "system",
-        "content": content,
+        "content": build_system_message_content(config),
     }))
 }
 
@@ -60,16 +54,9 @@ pub fn build_messages_for_session(
 ) -> CliResult<Vec<Value>> {
     let mut messages = Vec::new();
     if include_system_prompt {
-        let system = config.cli.system_prompt.trim();
-        let snapshot = super::tools::capability_snapshot();
-        let content = if system.is_empty() {
-            snapshot
-        } else {
-            format!("{system}\n\n{snapshot}")
-        };
         messages.push(json!({
             "role": "system",
-            "content": content,
+            "content": build_system_message_content(config),
         }));
     }
 
@@ -91,6 +78,107 @@ pub fn build_messages_for_session(
         let _ = session_id;
     }
     Ok(messages)
+}
+
+fn build_system_message_content(config: &LoongClawConfig) -> String {
+    let mut sections = Vec::new();
+    let system = config.cli.system_prompt.trim();
+    if !system.is_empty() {
+        sections.push(system.to_owned());
+    }
+    sections.push(super::tools::capability_snapshot());
+    sections.push(provider_runtime_snapshot(config));
+    sections.join("\n\n")
+}
+
+fn provider_runtime_snapshot(config: &LoongClawConfig) -> String {
+    let active_profile = config.active_provider_id().unwrap_or("default");
+    let mut profiles = if config.providers.is_empty() {
+        let mut active_profile_config =
+            super::config::ProviderProfileConfig::from_provider(config.provider.clone());
+        active_profile_config.default_for_kind = true;
+        vec![(active_profile.to_owned(), active_profile_config)]
+    } else {
+        config
+            .providers
+            .iter()
+            .map(|(profile_id, profile)| (profile_id.clone(), profile.clone()))
+            .collect::<Vec<_>>()
+    };
+    profiles.sort_by(|(left_id, _), (right_id, _)| {
+        let left_rank = usize::from(left_id != active_profile);
+        let right_rank = usize::from(right_id != active_profile);
+        left_rank
+            .cmp(&right_rank)
+            .then_with(|| left_id.cmp(right_id))
+    });
+
+    let mut kind_counts = BTreeMap::new();
+    for (_, profile) in &profiles {
+        *kind_counts
+            .entry(profile.provider.kind.as_str())
+            .or_insert(0usize) += 1;
+    }
+    let has_same_kind_duplicates = kind_counts.values().any(|count| *count > 1);
+    let selector_profiles = profiles
+        .iter()
+        .map(|(profile_id, profile)| {
+            ProviderSelectorProfileRef::new(
+                profile_id.as_str(),
+                profile.provider.kind,
+                profile.provider.model.as_str(),
+                profile.default_for_kind,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let profile_line = profiles
+        .iter()
+        .map(|(profile_id, profile)| {
+            let mut attributes = Vec::new();
+            if profile_id == active_profile {
+                attributes.push("active".to_owned());
+            }
+            if profile.default_for_kind {
+                attributes.push("default_for_kind".to_owned());
+            }
+            let selectors =
+                accepted_provider_selectors(selector_profiles.iter().copied(), profile_id);
+            if !selectors.is_empty() {
+                attributes.push(format!("selectors={}", selectors.join(", ")));
+            }
+
+            let mut summary = format!(
+                "{profile_id} [{} model={}",
+                profile.provider.kind.display_name(),
+                profile.provider.model
+            );
+            if !attributes.is_empty() {
+                summary.push_str(", ");
+                summary.push_str(attributes.join(", ").as_str());
+            }
+            summary.push(']');
+            summary
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    let mut lines = vec![
+        "[provider_runtime]".to_owned(),
+        format!("- active_profile: {active_profile}"),
+        format!("- profiles: {profile_line}"),
+        format!(
+            "- switch_rule: If the user explicitly asks to switch the default provider or says future turns should use another configured provider/profile, call provider.switch with selector set to the {PROVIDER_SELECTOR_TARGET_SUMMARY}."
+        ),
+        "- persistence: provider.switch updates the default provider for subsequent turns until the user changes it again.".to_owned(),
+        "- no_switch_rule: Do not call provider.switch for one-off comparisons or general discussion that does not request a persistent switch.".to_owned(),
+    ];
+    if has_same_kind_duplicates {
+        lines.push(
+            "- ambiguity_rule: If multiple profiles share the same provider kind and the user does not identify a specific profile, ask a concise clarification instead of guessing.".to_owned(),
+        );
+    }
+    lines.join("\n")
 }
 
 pub async fn request_completion(
@@ -1253,7 +1341,9 @@ fn kimi_extra_body(reasoning_effort: Option<ReasoningEffort>) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{LoongClawConfig, ProviderConfig, ReasoningEffort};
+    use crate::config::{
+        LoongClawConfig, ProviderConfig, ProviderKind, ProviderProfileConfig, ReasoningEffort,
+    };
     use serde_json::json;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1299,6 +1389,68 @@ mod tests {
             system_content.contains("- file.write: Write file contents"),
             "system prompt should list file.write tool"
         );
+    }
+
+    #[test]
+    fn build_messages_includes_provider_runtime_guidance_for_switchable_profiles() {
+        let mut config = test_config(ProviderConfig::default());
+
+        let mut openai = ProviderConfig::fresh_for_kind(ProviderKind::Openai);
+        openai.model = "gpt-5".to_owned();
+        config.set_active_provider_profile(
+            "openai-main",
+            ProviderProfileConfig {
+                default_for_kind: true,
+                provider: openai.clone(),
+            },
+        );
+
+        let mut deepseek = ProviderConfig::fresh_for_kind(ProviderKind::Deepseek);
+        deepseek.model = "deepseek-chat".to_owned();
+        config.providers.insert(
+            "deepseek-cn".to_owned(),
+            ProviderProfileConfig {
+                default_for_kind: true,
+                provider: deepseek,
+            },
+        );
+        let mut openai_reasoning = ProviderConfig::fresh_for_kind(ProviderKind::Openai);
+        openai_reasoning.model = "o4-mini".to_owned();
+        config.providers.insert(
+            "openai-reasoning".to_owned(),
+            ProviderProfileConfig {
+                default_for_kind: false,
+                provider: openai_reasoning,
+            },
+        );
+        config.provider = openai;
+        config.active_provider = Some("openai-main".to_owned());
+
+        let messages =
+            build_messages_for_session(&config, "noop-session", true).expect("build messages");
+        let system_content = messages[0]["content"].as_str().expect("system content");
+
+        assert!(system_content.contains("[provider_runtime]"));
+        assert!(system_content.contains("- active_profile: openai-main"));
+        assert!(
+            system_content.contains(
+                "openai-main [OpenAI model=gpt-5, active, default_for_kind, selectors=openai-main, gpt-5, openai]"
+            )
+        );
+        assert!(
+            system_content.contains(
+                "deepseek-cn [DeepSeek model=deepseek-chat, default_for_kind, selectors=deepseek-cn, deepseek-chat, deepseek]"
+            )
+        );
+        assert!(system_content.contains(
+            "openai-reasoning [OpenAI model=o4-mini, selectors=openai-reasoning, o4-mini]"
+        ));
+        assert!(system_content.contains(
+            "provider.switch updates the default provider for subsequent turns until the user changes it again"
+        ));
+        assert!(system_content.contains(
+            "If multiple profiles share the same provider kind and the user does not identify a specific profile"
+        ));
     }
 
     #[test]

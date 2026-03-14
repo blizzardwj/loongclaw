@@ -1567,6 +1567,7 @@ mod tests {
         ToolRuntimeConfig {
             shell_allowlist: BTreeSet::new(),
             file_root: Some(std::env::temp_dir().join("loongclaw-ext-skills-tests")),
+            config_path: None,
             external_skills: ExternalSkillsRuntimePolicy {
                 enabled: false,
                 require_download_approval: true,
@@ -1598,6 +1599,7 @@ mod tests {
         ToolRuntimeConfig {
             shell_allowlist: BTreeSet::new(),
             file_root: Some(root.to_path_buf()),
+            config_path: None,
             external_skills: ExternalSkillsRuntimePolicy {
                 enabled: true,
                 require_download_approval: true,

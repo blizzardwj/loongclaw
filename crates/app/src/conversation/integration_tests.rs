@@ -93,6 +93,7 @@ impl TurnTestHarness {
         let tool_config = ToolRuntimeConfig {
             shell_allowlist: BTreeSet::from(["echo".to_owned(), "cat".to_owned(), "ls".to_owned()]),
             file_root: Some(temp_dir.clone()),
+            config_path: Some(temp_dir.join("loongclaw.toml")),
             external_skills: Default::default(),
         };
 

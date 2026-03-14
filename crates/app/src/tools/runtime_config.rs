@@ -33,6 +33,7 @@ impl Default for ExternalSkillsRuntimePolicy {
 pub struct ToolRuntimeConfig {
     pub shell_allowlist: BTreeSet<String>,
     pub file_root: Option<PathBuf>,
+    pub config_path: Option<PathBuf>,
     pub external_skills: ExternalSkillsRuntimePolicy,
 }
 
@@ -52,6 +53,9 @@ impl ToolRuntimeConfig {
             .collect();
 
         let file_root = std::env::var("LOONGCLAW_FILE_ROOT").ok().map(PathBuf::from);
+        let config_path = std::env::var("LOONGCLAW_CONFIG_PATH")
+            .ok()
+            .map(PathBuf::from);
         let enabled = parse_env_bool("LOONGCLAW_EXTERNAL_SKILLS_ENABLED").unwrap_or(false);
         let require_download_approval =
             parse_env_bool("LOONGCLAW_EXTERNAL_SKILLS_REQUIRE_DOWNLOAD_APPROVAL").unwrap_or(true);
@@ -66,6 +70,7 @@ impl ToolRuntimeConfig {
         Self {
             shell_allowlist,
             file_root,
+            config_path,
             external_skills: ExternalSkillsRuntimePolicy {
                 enabled,
                 require_download_approval,
@@ -130,6 +135,7 @@ mod tests {
         let config = ToolRuntimeConfig::default();
         assert!(config.shell_allowlist.is_empty());
         assert!(config.file_root.is_none());
+        assert!(config.config_path.is_none());
         assert!(!config.external_skills.enabled);
         assert!(config.external_skills.require_download_approval);
         assert!(config.external_skills.allowed_domains.is_empty());
@@ -145,6 +151,7 @@ mod tests {
         let config = ToolRuntimeConfig {
             shell_allowlist: BTreeSet::from(["git".to_owned(), "cargo".to_owned()]),
             file_root: Some(PathBuf::from("/tmp/test-root")),
+            config_path: Some(PathBuf::from("/tmp/test-root/loongclaw.toml")),
             external_skills: ExternalSkillsRuntimePolicy {
                 enabled: true,
                 require_download_approval: false,
@@ -158,6 +165,10 @@ mod tests {
         assert!(config.shell_allowlist.contains("cargo"));
         assert!(!config.shell_allowlist.contains("echo"));
         assert_eq!(config.file_root, Some(PathBuf::from("/tmp/test-root")));
+        assert_eq!(
+            config.config_path,
+            Some(PathBuf::from("/tmp/test-root/loongclaw.toml"))
+        );
         assert!(config.external_skills.enabled);
         assert!(!config.external_skills.require_download_approval);
         assert!(config.external_skills.allowed_domains.contains("skills.sh"));
@@ -184,6 +195,7 @@ mod tests {
         let config = ToolRuntimeConfig {
             shell_allowlist: BTreeSet::from(["echo".to_owned()]),
             file_root: Some(PathBuf::from("/tmp/injected-root")),
+            config_path: Some(PathBuf::from("/tmp/injected-root/loongclaw.toml")),
             external_skills: ExternalSkillsRuntimePolicy::default(),
         };
         let result = crate::tools::execute_tool_core_with_config(
