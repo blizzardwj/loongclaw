@@ -2747,14 +2747,14 @@ async fn execute_provider_turn_lane<R: ConversationRuntime + ?Sized>(
     let lane = preparation.lane_plan.decision.lane;
     let (turn_result, safe_lane_terminal_route) = if preparation
         .lane_plan
-        .should_use_safe_lane_plan_path(config, &turn)
+        .should_use_safe_lane_plan_path(config, turn)
     {
         let outcome = execute_turn_with_safe_lane_plan(
             config,
             runtime,
             session_id,
             &preparation.lane_plan.decision,
-            &turn,
+            turn,
             kernel_ctx,
         )
         .await;
@@ -4729,7 +4729,7 @@ mod tests {
                     source: SafeLaneFailureRouteSource::SessionGovernor,
                 }),
             },
-            config.clone(),
+            config,
         );
 
         let checkpoint =

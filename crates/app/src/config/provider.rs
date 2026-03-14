@@ -243,21 +243,12 @@ pub struct ProviderConfig {
     pub reasoning_extra_body_omit_model_hints: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ProviderProfileConfig {
     #[serde(default)]
     pub default_for_kind: bool,
     #[serde(flatten)]
     pub provider: ProviderConfig,
-}
-
-impl Default for ProviderProfileConfig {
-    fn default() -> Self {
-        Self {
-            default_for_kind: false,
-            provider: ProviderConfig::default(),
-        }
-    }
 }
 
 impl Default for ProviderConfig {
@@ -308,9 +299,11 @@ impl Default for ProviderConfig {
 
 impl ProviderConfig {
     pub fn fresh_for_kind(kind: ProviderKind) -> Self {
-        let mut provider = Self::default();
-        provider.kind = kind;
-        provider.model = kind.default_model().unwrap_or("auto").to_owned();
+        let provider = Self {
+            kind,
+            model: kind.default_model().unwrap_or("auto").to_owned(),
+            ..Self::default()
+        };
         provider.selection_baseline()
     }
 
@@ -632,18 +625,19 @@ impl ProviderConfig {
 
     pub fn selection_baseline(&self) -> Self {
         let profile = self.kind.profile();
-        let mut baseline = Self::default();
-        baseline.kind = self.kind;
-        baseline.model = self.model.clone();
-        baseline.base_url = profile.base_url.to_owned();
-        baseline.wire_api = self.wire_api;
-        baseline.chat_completions_path = profile.chat_completions_path.to_owned();
-        baseline.api_key_env = self.kind.default_api_key_env().map(str::to_owned);
-        baseline.oauth_access_token_env = self
-            .kind
-            .default_oauth_access_token_env()
-            .map(str::to_owned);
-        baseline
+        Self {
+            kind: self.kind,
+            model: self.model.clone(),
+            base_url: profile.base_url.to_owned(),
+            wire_api: self.wire_api,
+            chat_completions_path: profile.chat_completions_path.to_owned(),
+            api_key_env: self.kind.default_api_key_env().map(str::to_owned),
+            oauth_access_token_env: self
+                .kind
+                .default_oauth_access_token_env()
+                .map(str::to_owned),
+            ..Self::default()
+        }
     }
 
     pub fn has_only_selection_changes(&self) -> bool {
@@ -929,39 +923,46 @@ impl ProviderKind {
     }
 
     pub const fn api_key_env_aliases(self) -> &'static [&'static str] {
-        match self {
-            ProviderKind::Zhipu => &["ZHIPU_API_KEY"],
-            _ => &[],
+        if matches!(self, ProviderKind::Zhipu) {
+            &["ZHIPU_API_KEY"]
+        } else {
+            &[]
         }
     }
 
     pub const fn default_model(self) -> Option<&'static str> {
-        match self {
-            ProviderKind::KimiCoding => Some("kimi-for-coding"),
-            _ => None,
+        if matches!(self, ProviderKind::KimiCoding) {
+            Some("kimi-for-coding")
+        } else {
+            None
         }
     }
 
     pub const fn default_user_agent(self) -> Option<&'static str> {
-        match self {
-            ProviderKind::KimiCoding => Some("KimiCLI/LoongClaw"),
-            _ => None,
+        if matches!(self, ProviderKind::KimiCoding) {
+            Some("KimiCLI/LoongClaw")
+        } else {
+            None
         }
     }
 
     pub const fn default_oauth_access_token_env(self) -> Option<&'static str> {
-        match self {
-            ProviderKind::Openai => Some("OPENAI_CODEX_OAUTH_TOKEN"),
-            ProviderKind::Volcengine => Some("VOLCENGINE_CODING_PLAN_OAUTH_TOKEN"),
-            _ => None,
+        if matches!(self, ProviderKind::Openai) {
+            Some("OPENAI_CODEX_OAUTH_TOKEN")
+        } else if matches!(self, ProviderKind::Volcengine) {
+            Some("VOLCENGINE_CODING_PLAN_OAUTH_TOKEN")
+        } else {
+            None
         }
     }
 
     pub const fn oauth_access_token_env_aliases(self) -> &'static [&'static str] {
-        match self {
-            ProviderKind::Openai => &["OPENAI_OAUTH_ACCESS_TOKEN"],
-            ProviderKind::Volcengine => &["ARK_OAUTH_ACCESS_TOKEN"],
-            _ => &[],
+        if matches!(self, ProviderKind::Openai) {
+            &["OPENAI_OAUTH_ACCESS_TOKEN"]
+        } else if matches!(self, ProviderKind::Volcengine) {
+            &["ARK_OAUTH_ACCESS_TOKEN"]
+        } else {
+            &[]
         }
     }
 }

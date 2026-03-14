@@ -35,6 +35,7 @@ use loongclaw_bench::{
     run_wasm_cache_benchmark_cli,
 };
 mod doctor_cli;
+#[cfg(test)]
 mod import_claw_cli;
 mod import_cli;
 mod migration;

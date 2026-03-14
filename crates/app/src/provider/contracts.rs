@@ -42,12 +42,13 @@ pub(super) enum ProviderTransportMode {
 
 impl ProviderTransportMode {
     fn for_provider(provider: &ProviderConfig) -> Self {
-        match provider.kind {
-            ProviderKind::KimiCoding => Self::KimiApi,
-            _ => match provider.wire_api {
+        if provider.kind == ProviderKind::KimiCoding {
+            Self::KimiApi
+        } else {
+            match provider.wire_api {
                 ProviderWireApi::ChatCompletions => Self::OpenAiChatCompletions,
                 ProviderWireApi::Responses => Self::Responses,
-            },
+            }
         }
     }
 }
