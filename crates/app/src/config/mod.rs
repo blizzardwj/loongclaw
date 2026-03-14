@@ -21,10 +21,10 @@ pub(crate) use channels::{
 pub use conversation::{ConversationConfig, ConversationTurnLoopConfig};
 #[allow(unused_imports)]
 pub use provider::{
-    ProviderConfig, ProviderKind, ProviderProfileHealthModeConfig, ProviderProfileStateBackendKind,
-    ProviderReasoningExtraBodyModeConfig, ProviderToolSchemaModeConfig, ProviderTransportFallback,
-    ProviderTransportPolicy, ProviderTransportReadiness, ProviderTransportReadinessLevel,
-    ProviderWireApi, ReasoningEffort,
+    ProviderConfig, ProviderKind, ProviderProfileConfig, ProviderProfileHealthModeConfig,
+    ProviderProfileStateBackendKind, ProviderReasoningExtraBodyModeConfig,
+    ProviderToolSchemaModeConfig, ProviderTransportFallback, ProviderTransportPolicy,
+    ProviderTransportReadiness, ProviderTransportReadinessLevel, ProviderWireApi, ReasoningEffort,
 };
 #[allow(unused_imports)]
 pub use runtime::{
