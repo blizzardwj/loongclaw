@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use async_trait::async_trait;
-use loongclaw_contracts::{AuditEventKind, Capability, ExecutionPlane, PlaneTier, ToolCoreRequest};
+use loongclaw_contracts::{AuditEventKind, ExecutionPlane, PlaneTier, ToolCoreRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
