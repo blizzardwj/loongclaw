@@ -57,6 +57,7 @@ where
                         try_next_model,
                         reason,
                         snapshot,
+                        ..
                     } = model_error;
                     record_provider_failover_audit_event(
                         kernel_ctx,
