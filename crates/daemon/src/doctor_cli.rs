@@ -395,7 +395,9 @@ pub(crate) fn check_feishu_integration(
 
         let now_s = chrono::Utc::now().timestamp();
         let required_scopes = config.feishu_integration.trimmed_default_scopes();
-        let latest = &inventory.grants[0];
+        let Some(latest) = inventory.grants.first() else {
+            continue;
+        };
         let effective_grant = inventory.effective_grant();
         let effective_status =
             mvp::feishu::auth::summarize_grant_status(effective_grant, now_s, &required_scopes);
@@ -427,18 +429,29 @@ pub(crate) fn check_feishu_integration(
                 DoctorCheckLevel::Pass
             },
             detail: if let Some(selected_open_id) = inventory.selected_open_id.as_deref() {
-                let selected_grant = inventory
+                if let Some(selected_grant) = inventory
                     .grants
                     .iter()
                     .find(|grant| grant.principal.open_id == selected_open_id)
-                    .expect("selected_open_id should always resolve to a stored grant");
-                format!(
-                    "configured_account={} account={} selected_open_id={} selected_name={}",
-                    resolved.configured_account_id,
-                    resolved.account.id,
-                    selected_grant.principal.open_id,
-                    selected_grant.principal.name.as_deref().unwrap_or("-")
-                )
+                {
+                    format!(
+                        "configured_account={} account={} selected_open_id={} selected_name={}",
+                        resolved.configured_account_id,
+                        resolved.account.id,
+                        selected_grant.principal.open_id,
+                        selected_grant.principal.name.as_deref().unwrap_or("-")
+                    )
+                } else {
+                    format!(
+                        "configured_account={} account={} stale selected_open_id={} (grant not found); rerun `{}`",
+                        resolved.configured_account_id,
+                        resolved.account.id,
+                        selected_open_id,
+                        crate::feishu_support::feishu_auth_select_command_hint(
+                            resolved.configured_account_id.as_str(),
+                        )
+                    )
+                }
             } else if let Some(selected_open_id) = inventory
                 .stale_selected_open_id
                 .as_deref()
@@ -1224,7 +1237,7 @@ mod tests {
         store
             .save_grant(&mvp::feishu::FeishuGrant {
                 principal: mvp::feishu::FeishuUserPrincipal {
-                    account_id: resolved.account.id.clone(),
+                    account_id: resolved.account.id,
                     open_id: "ou_123".to_owned(),
                     union_id: Some("on_456".to_owned()),
                     user_id: Some("u_789".to_owned()),

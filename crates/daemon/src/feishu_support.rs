@@ -170,11 +170,7 @@ pub(crate) fn normalized_auth_start_capabilities(
             normalized.push(*capability);
         }
     }
-    if include_message_write
-        && !normalized
-            .iter()
-            .any(|existing| *existing == FeishuAuthCapability::MessageWrite)
-    {
+    if include_message_write && !normalized.contains(&FeishuAuthCapability::MessageWrite) {
         normalized.push(FeishuAuthCapability::MessageWrite);
     }
     normalized
@@ -277,6 +273,7 @@ pub(crate) fn build_account_recommendations(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_selected_grant(
     store: &mvp::feishu::FeishuTokenStore,
     account_id: &str,
@@ -600,8 +597,8 @@ mod tests {
 
         let recommendations = build_grant_recommendations("feishu_main", Some(&grant), now_s, &[]);
 
-        assert_eq!(recommendations.missing_doc_write_scope, true);
-        assert_eq!(recommendations.missing_message_write_scope, true);
+        assert!(recommendations.missing_doc_write_scope);
+        assert!(recommendations.missing_message_write_scope);
         assert_eq!(
             recommendations.auth_start_command.as_deref(),
             Some(

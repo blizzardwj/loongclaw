@@ -637,7 +637,6 @@ pub(crate) async fn execute_feishu_auth_list(args: &FeishuAuthListArgs) -> CliRe
     let grants = inventory
         .grants
         .iter()
-        .into_iter()
         .map(|grant| {
             serialize_grant_summary(
                 grant,
@@ -991,7 +990,7 @@ pub(crate) async fn execute_feishu_doc_append(args: &FeishuDocAppendArgs) -> Cli
         args.content_type.as_deref(),
         true,
     )?
-    .expect("required doc append content should be present");
+    .ok_or_else(|| "loongclaw feishu doc append requires --content or --content-path".to_owned())?;
     let document_id = mvp::feishu::resources::docs::extract_document_id(url)
         .ok_or_else(|| "failed to resolve Feishu document id".to_owned())?;
     let converted = mvp::feishu::resources::docs::convert_content_to_blocks(
@@ -1485,7 +1484,9 @@ fn prepare_feishu_doc_cli_content(
         }
         (None, None) if required => Err(format!("{action} requires --content or --content-path")),
         (None, None) => Ok(None),
-        (Some(_), Some(_)) => unreachable!("content source exclusivity validated above"),
+        (Some(_), Some(_)) => Err(format!(
+            "{action} accepts either --content or --content-path, not both"
+        )),
     }
 }
 
