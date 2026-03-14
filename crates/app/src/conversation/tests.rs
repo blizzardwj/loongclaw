@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use loongclaw_contracts::{Capability, ExecutionRoute, HarnessKind, MemoryPlaneError};
@@ -9,7 +8,6 @@ use loongclaw_kernel::{
     MemoryCoreRequest, StaticPolicyEngine, VerticalPackManifest,
 };
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use super::super::config::{
     CliChannelConfig, ConversationConfig, ExternalSkillsConfig, FeishuChannelConfig,
@@ -20,274 +18,17 @@ use super::runtime::DefaultConversationRuntime;
 use super::*;
 use crate::CliResult;
 use crate::KernelContext;
-use crate::acp::{
-    ACP_TURN_METADATA_ACK_CURSOR, ACP_TURN_METADATA_ROUTING_INTENT,
-    ACP_TURN_METADATA_SOURCE_MESSAGE_ID, ACP_TURN_METADATA_TRACE_ID, AcpBackendMetadata,
-    AcpCapability, AcpConversationTurnOptions, AcpRoutingIntent, AcpRuntimeBackend,
-    AcpSessionBootstrap, AcpSessionHandle, AcpSessionState, AcpTurnEventSink, AcpTurnProvenance,
-    AcpTurnRequest, AcpTurnResult, AcpTurnStopReason, register_acp_backend,
-};
-use crate::memory::MEMORY_OP_WINDOW;
-#[cfg(feature = "memory-sqlite")]
-use crate::memory::runtime_config::MemoryRuntimeConfig;
 
 struct FakeRuntime {
     seed_messages: Vec<Value>,
-    assembled_context_with_system_prompt: Option<AssembledConversationContext>,
-    assembled_context_without_system_prompt: Option<AssembledConversationContext>,
     completion_responses: Mutex<VecDeque<Result<String, String>>>,
     turn_responses: Mutex<VecDeque<Result<ProviderTurn, String>>>,
-    after_turn_result: Result<(), String>,
-    compact_result: Result<(), String>,
-    #[cfg(feature = "memory-sqlite")]
-    durable_memory_config: Option<MemoryRuntimeConfig>,
     persisted: Mutex<Vec<(String, String, String)>>,
-    bootstrap_calls: Mutex<Vec<String>>,
-    ingested_messages: Mutex<Vec<(String, Value)>>,
     requested_messages: Mutex<Vec<Value>>,
     turn_requested_messages: Mutex<Vec<Vec<Value>>>,
     completion_requested_messages: Mutex<Vec<Vec<Value>>>,
-    build_context_calls: Mutex<Vec<(String, bool)>>,
     completion_calls: Mutex<usize>,
     turn_calls: Mutex<usize>,
-    after_turn_calls: Mutex<Vec<(String, String, String, usize)>>,
-    compact_calls: Mutex<Vec<(String, usize)>>,
-}
-
-struct StubContextEngine;
-struct StubEnvContextEngine;
-struct StubSystemPromptAdditionEngine;
-struct RecordingLifecycleContextEngine {
-    calls: Arc<Mutex<Vec<String>>>,
-}
-
-#[derive(Default)]
-struct RoutedAcpState {
-    ensure_calls: usize,
-    turn_calls: usize,
-    last_bootstrap: Option<AcpSessionBootstrap>,
-    last_request: Option<AcpTurnRequest>,
-}
-
-struct RoutedAcpBackend {
-    id: &'static str,
-    shared: Arc<Mutex<RoutedAcpState>>,
-    fail_turn: bool,
-    emitted_events: Vec<Value>,
-}
-
-#[derive(Default)]
-struct RecordingAcpEventSink {
-    events: Mutex<Vec<Value>>,
-}
-
-impl RecordingAcpEventSink {
-    fn snapshot(&self) -> Vec<Value> {
-        self.events
-            .lock()
-            .expect("recording ACP event sink lock")
-            .clone()
-    }
-}
-
-impl AcpTurnEventSink for RecordingAcpEventSink {
-    fn on_event(&self, event: &Value) -> CliResult<()> {
-        self.events
-            .lock()
-            .expect("recording ACP event sink lock")
-            .push(event.clone());
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl ConversationContextEngine for StubContextEngine {
-    fn id(&self) -> &'static str {
-        "stub-context-engine"
-    }
-
-    async fn assemble_messages(
-        &self,
-        _config: &LoongClawConfig,
-        _session_id: &str,
-        _include_system_prompt: bool,
-        _kernel_ctx: Option<&KernelContext>,
-    ) -> CliResult<Vec<Value>> {
-        Ok(vec![json!({
-            "role": "system",
-            "content": "stub-context-engine",
-        })])
-    }
-}
-
-#[async_trait]
-impl ConversationContextEngine for StubEnvContextEngine {
-    fn id(&self) -> &'static str {
-        "stub-env-context-engine"
-    }
-
-    async fn assemble_messages(
-        &self,
-        _config: &LoongClawConfig,
-        _session_id: &str,
-        _include_system_prompt: bool,
-        _kernel_ctx: Option<&KernelContext>,
-    ) -> CliResult<Vec<Value>> {
-        Ok(vec![json!({
-            "role": "system",
-            "content": "stub-env-context-engine",
-        })])
-    }
-}
-
-#[async_trait]
-impl ConversationContextEngine for StubSystemPromptAdditionEngine {
-    fn id(&self) -> &'static str {
-        "stub-system-prompt-addition"
-    }
-
-    fn metadata(&self) -> ContextEngineMetadata {
-        ContextEngineMetadata::new(self.id(), [ContextEngineCapability::SystemPromptAddition])
-    }
-
-    async fn assemble_context(
-        &self,
-        _config: &LoongClawConfig,
-        _session_id: &str,
-        _include_system_prompt: bool,
-        _kernel_ctx: Option<&KernelContext>,
-    ) -> CliResult<AssembledConversationContext> {
-        Ok(AssembledConversationContext {
-            messages: vec![json!({
-                "role": "system",
-                "content": "base-system-prompt",
-            })],
-            estimated_tokens: Some(42),
-            system_prompt_addition: Some("runtime-policy-addition".to_owned()),
-        })
-    }
-
-    async fn assemble_messages(
-        &self,
-        _config: &LoongClawConfig,
-        _session_id: &str,
-        _include_system_prompt: bool,
-        _kernel_ctx: Option<&KernelContext>,
-    ) -> CliResult<Vec<Value>> {
-        Ok(vec![json!({
-            "role": "system",
-            "content": "base-system-prompt",
-        })])
-    }
-}
-
-#[async_trait]
-impl ConversationContextEngine for RecordingLifecycleContextEngine {
-    fn id(&self) -> &'static str {
-        "recording-lifecycle-context-engine"
-    }
-
-    async fn bootstrap(
-        &self,
-        _config: &LoongClawConfig,
-        session_id: &str,
-        _kernel_ctx: Option<&KernelContext>,
-    ) -> CliResult<ContextEngineBootstrapResult> {
-        self.calls
-            .lock()
-            .expect("recording context engine lock")
-            .push(format!("bootstrap:{session_id}"));
-        Ok(ContextEngineBootstrapResult {
-            bootstrapped: true,
-            imported_messages: Some(0),
-            reason: None,
-        })
-    }
-
-    async fn ingest(
-        &self,
-        session_id: &str,
-        message: &Value,
-        _kernel_ctx: Option<&KernelContext>,
-    ) -> CliResult<ContextEngineIngestResult> {
-        let role = message
-            .get("role")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        self.calls
-            .lock()
-            .expect("recording context engine lock")
-            .push(format!("ingest:{session_id}:{role}"));
-        Ok(ContextEngineIngestResult { ingested: true })
-    }
-
-    async fn prepare_subagent_spawn(
-        &self,
-        parent_session_id: &str,
-        subagent_session_id: &str,
-        _kernel_ctx: Option<&KernelContext>,
-    ) -> CliResult<()> {
-        self.calls
-            .lock()
-            .expect("recording context engine lock")
-            .push(format!(
-                "prepare_subagent_spawn:{parent_session_id}:{subagent_session_id}"
-            ));
-        Ok(())
-    }
-
-    async fn on_subagent_ended(
-        &self,
-        parent_session_id: &str,
-        subagent_session_id: &str,
-        _kernel_ctx: Option<&KernelContext>,
-    ) -> CliResult<()> {
-        self.calls
-            .lock()
-            .expect("recording context engine lock")
-            .push(format!(
-                "on_subagent_ended:{parent_session_id}:{subagent_session_id}"
-            ));
-        Ok(())
-    }
-
-    async fn assemble_messages(
-        &self,
-        _config: &LoongClawConfig,
-        _session_id: &str,
-        _include_system_prompt: bool,
-        _kernel_ctx: Option<&KernelContext>,
-    ) -> CliResult<Vec<Value>> {
-        Ok(Vec::new())
-    }
-}
-
-fn context_engine_env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-struct ScopedEnvVar {
-    previous: Option<Option<String>>,
-}
-
-impl ScopedEnvVar {
-    fn set(key: &'static str, value: &str) -> Self {
-        assert_eq!(key, CONTEXT_ENGINE_ENV, "unexpected scoped env key");
-        let previous = Some(super::context_engine_registry::context_engine_id_from_env());
-        super::context_engine_registry::set_context_engine_env_override(Some(value));
-        Self { previous }
-    }
-}
-
-impl Drop for ScopedEnvVar {
-    fn drop(&mut self) {
-        if let Some(previous) = self.previous.as_ref() {
-            super::context_engine_registry::set_context_engine_env_override(previous.as_deref());
-        } else {
-            super::context_engine_registry::clear_context_engine_env_override();
-        }
-    }
 }
 
 impl FakeRuntime {
@@ -320,318 +61,34 @@ impl FakeRuntime {
     ) -> Self {
         Self {
             seed_messages,
-            assembled_context_with_system_prompt: None,
-            assembled_context_without_system_prompt: None,
             completion_responses: Mutex::new(VecDeque::from(completions)),
             turn_responses: Mutex::new(VecDeque::from(turns)),
-            after_turn_result: Ok(()),
-            compact_result: Ok(()),
-            #[cfg(feature = "memory-sqlite")]
-            durable_memory_config: None,
             persisted: Mutex::new(Vec::new()),
-            bootstrap_calls: Mutex::new(Vec::new()),
-            ingested_messages: Mutex::new(Vec::new()),
             requested_messages: Mutex::new(Vec::new()),
             turn_requested_messages: Mutex::new(Vec::new()),
             completion_requested_messages: Mutex::new(Vec::new()),
-            build_context_calls: Mutex::new(Vec::new()),
             completion_calls: Mutex::new(0),
             turn_calls: Mutex::new(0),
-            after_turn_calls: Mutex::new(Vec::new()),
-            compact_calls: Mutex::new(Vec::new()),
         }
-    }
-
-    fn with_assembled_context(mut self, assembled_context: AssembledConversationContext) -> Self {
-        self.assembled_context_with_system_prompt = Some(assembled_context.clone());
-        self.assembled_context_without_system_prompt = Some(assembled_context);
-        self
-    }
-
-    fn with_assembled_context_variants(
-        mut self,
-        with_system_prompt: AssembledConversationContext,
-        without_system_prompt: AssembledConversationContext,
-    ) -> Self {
-        self.assembled_context_with_system_prompt = Some(with_system_prompt);
-        self.assembled_context_without_system_prompt = Some(without_system_prompt);
-        self
-    }
-
-    fn with_after_turn_result(mut self, result: Result<(), String>) -> Self {
-        self.after_turn_result = result;
-        self
-    }
-
-    fn with_compact_result(mut self, result: Result<(), String>) -> Self {
-        self.compact_result = result;
-        self
-    }
-
-    #[cfg(feature = "memory-sqlite")]
-    fn with_durable_memory_config(mut self, config: MemoryRuntimeConfig) -> Self {
-        self.durable_memory_config = Some(config);
-        self
-    }
-}
-
-fn unique_acp_test_id(prefix: &str, suffix: &str) -> String {
-    format!(
-        "{prefix}-{suffix}-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    )
-}
-
-fn register_routed_acp_backend(
-    suffix: &str,
-    fail_turn: bool,
-) -> (&'static str, Arc<Mutex<RoutedAcpState>>) {
-    register_routed_acp_backend_with_events(suffix, fail_turn, Vec::new())
-}
-
-fn register_routed_acp_backend_with_events(
-    suffix: &str,
-    fail_turn: bool,
-    emitted_events: Vec<Value>,
-) -> (&'static str, Arc<Mutex<RoutedAcpState>>) {
-    let backend_id: &'static str =
-        Box::leak(unique_acp_test_id("conversation-acp-backend", suffix).into_boxed_str());
-    let shared = Arc::new(Mutex::new(RoutedAcpState::default()));
-    register_acp_backend(backend_id, {
-        let shared = shared.clone();
-        move || {
-            Box::new(RoutedAcpBackend {
-                id: backend_id,
-                shared: shared.clone(),
-                fail_turn,
-                emitted_events: emitted_events.clone(),
-            })
-        }
-    })
-    .expect("register routed ACP backend");
-    (backend_id, shared)
-}
-
-fn unique_acp_sqlite_path(suffix: &str) -> String {
-    std::env::temp_dir()
-        .join(format!(
-            "{}.sqlite3",
-            unique_acp_test_id("conversation-acp", suffix)
-        ))
-        .display()
-        .to_string()
-}
-
-fn persisted_conversation_event_payloads_by_name(
-    persisted: &[(String, String, String)],
-    event_name: &str,
-) -> Vec<Value> {
-    persisted
-        .iter()
-        .filter_map(|(_, role, content)| {
-            if role != "assistant" {
-                return None;
-            }
-            let parsed = serde_json::from_str::<Value>(content).ok()?;
-            if parsed.get("type")?.as_str()? != "conversation_event" {
-                return None;
-            }
-            (parsed.get("event")?.as_str()? == event_name)
-                .then(|| parsed.get("payload").cloned().unwrap_or(Value::Null))
-        })
-        .collect()
-}
-
-fn is_internal_assistant_record(content: &str) -> bool {
-    serde_json::from_str::<Value>(content)
-        .ok()
-        .and_then(|parsed| {
-            parsed
-                .get("type")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .map(|event_type| {
-            matches!(
-                event_type.as_str(),
-                "conversation_event" | "tool_decision" | "tool_outcome"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn persisted_visible_turns(
-    persisted: &[(String, String, String)],
-) -> Vec<(String, String, String)> {
-    persisted
-        .iter()
-        .filter(|(_, role, content)| *role != "assistant" || !is_internal_assistant_record(content))
-        .cloned()
-        .collect()
-}
-
-fn test_turn_checkpoint_identity(user_input: &str, assistant_reply: &str) -> Value {
-    json!({
-        "user_input_sha256": format!("{:x}", Sha256::digest(user_input.as_bytes())),
-        "assistant_reply_sha256": format!("{:x}", Sha256::digest(assistant_reply.as_bytes())),
-        "user_input_chars": user_input.chars().count(),
-        "assistant_reply_chars": assistant_reply.chars().count(),
-    })
-}
-
-fn test_turn_preparation_context_fingerprint(messages: &[Value]) -> String {
-    let serialized =
-        serde_json::to_vec(messages).expect("serializing test preparation messages should work");
-    format!("{:x}", Sha256::digest(serialized))
-}
-
-#[async_trait]
-impl AcpRuntimeBackend for RoutedAcpBackend {
-    fn id(&self) -> &'static str {
-        self.id
-    }
-
-    fn metadata(&self) -> AcpBackendMetadata {
-        AcpBackendMetadata::new(
-            self.id(),
-            [
-                AcpCapability::SessionLifecycle,
-                AcpCapability::TurnExecution,
-            ],
-            "Conversation ACP routing test backend",
-        )
-    }
-
-    async fn ensure_session(
-        &self,
-        _config: &LoongClawConfig,
-        request: &AcpSessionBootstrap,
-    ) -> CliResult<AcpSessionHandle> {
-        let mut guard = self.shared.lock().expect("routed ACP state lock");
-        guard.ensure_calls += 1;
-        guard.last_bootstrap = Some(request.clone());
-        Ok(AcpSessionHandle {
-            session_key: request.session_key.clone(),
-            backend_id: self.id().to_owned(),
-            runtime_session_name: format!("routed-{}", request.session_key),
-            working_directory: None,
-            backend_session_id: Some(format!("backend-{}", request.session_key)),
-            agent_session_id: Some(format!("agent-{}", request.session_key)),
-            binding: request.binding.clone(),
-        })
-    }
-
-    async fn run_turn(
-        &self,
-        _config: &LoongClawConfig,
-        _session: &AcpSessionHandle,
-        request: &AcpTurnRequest,
-    ) -> CliResult<AcpTurnResult> {
-        let mut guard = self.shared.lock().expect("routed ACP state lock");
-        guard.turn_calls += 1;
-        guard.last_request = Some(request.clone());
-        if self.fail_turn {
-            return Err("synthetic ACP routing failure".to_owned());
-        }
-        Ok(AcpTurnResult {
-            output_text: format!("acp: {}", request.input),
-            state: AcpSessionState::Ready,
-            usage: None,
-            events: self.emitted_events.clone(),
-            stop_reason: Some(AcpTurnStopReason::Completed),
-        })
-    }
-
-    async fn cancel(
-        &self,
-        _config: &LoongClawConfig,
-        _session: &AcpSessionHandle,
-    ) -> CliResult<()> {
-        Ok(())
-    }
-
-    async fn close(&self, _config: &LoongClawConfig, _session: &AcpSessionHandle) -> CliResult<()> {
-        Ok(())
     }
 }
 
 #[async_trait]
 impl ConversationRuntime for FakeRuntime {
-    async fn bootstrap(
-        &self,
-        _config: &LoongClawConfig,
-        session_id: &str,
-        _kernel_ctx: Option<&KernelContext>,
-    ) -> CliResult<ContextEngineBootstrapResult> {
-        self.bootstrap_calls
-            .lock()
-            .expect("bootstrap lock")
-            .push(session_id.to_owned());
-        Ok(ContextEngineBootstrapResult {
-            bootstrapped: true,
-            imported_messages: Some(0),
-            reason: None,
-        })
-    }
-
-    async fn ingest(
-        &self,
-        session_id: &str,
-        message: &Value,
-        _kernel_ctx: Option<&KernelContext>,
-    ) -> CliResult<ContextEngineIngestResult> {
-        self.ingested_messages
-            .lock()
-            .expect("ingest lock")
-            .push((session_id.to_owned(), message.clone()));
-        Ok(ContextEngineIngestResult { ingested: true })
-    }
     async fn build_messages(
         &self,
         _config: &LoongClawConfig,
         _session_id: &str,
-        include_system_prompt: bool,
+        _include_system_prompt: bool,
         _kernel_ctx: Option<&KernelContext>,
     ) -> CliResult<Vec<Value>> {
-        let assembled = if include_system_prompt {
-            self.assembled_context_with_system_prompt.as_ref()
-        } else {
-            self.assembled_context_without_system_prompt.as_ref()
-        };
-        Ok(assembled
-            .map(|context| context.messages.clone())
-            .unwrap_or_else(|| self.seed_messages.clone()))
-    }
-
-    async fn build_context(
-        &self,
-        _config: &LoongClawConfig,
-        session_id: &str,
-        include_system_prompt: bool,
-        _kernel_ctx: Option<&KernelContext>,
-    ) -> CliResult<AssembledConversationContext> {
-        self.build_context_calls
-            .lock()
-            .expect("build context lock")
-            .push((session_id.to_owned(), include_system_prompt));
-        let assembled = if include_system_prompt {
-            self.assembled_context_with_system_prompt.clone()
-        } else {
-            self.assembled_context_without_system_prompt.clone()
-        };
-        Ok(assembled.unwrap_or_else(|| {
-            AssembledConversationContext::from_messages(self.seed_messages.clone())
-        }))
+        Ok(self.seed_messages.clone())
     }
 
     async fn request_completion(
         &self,
         _config: &LoongClawConfig,
         messages: &[Value],
-        _kernel_ctx: Option<&KernelContext>,
     ) -> CliResult<String> {
         let mut calls = self.completion_calls.lock().expect("completion calls lock");
         *calls += 1;
@@ -646,13 +103,13 @@ impl ConversationRuntime for FakeRuntime {
             .expect("completion response lock")
             .pop_front()
             .unwrap_or_else(|| Err("unexpected_completion_call".to_owned()))
+            .map_err(|error| error.to_owned())
     }
 
     async fn request_turn(
         &self,
         _config: &LoongClawConfig,
         messages: &[Value],
-        _kernel_ctx: Option<&KernelContext>,
     ) -> CliResult<ProviderTurn> {
         let mut calls = self.turn_calls.lock().expect("turn calls lock");
         *calls += 1;
@@ -667,6 +124,7 @@ impl ConversationRuntime for FakeRuntime {
             .expect("turn response lock")
             .pop_front()
             .unwrap_or_else(|| Err("unexpected_turn_call".to_owned()))
+            .map_err(|error| error.to_owned())
     }
 
     async fn persist_turn(
@@ -676,51 +134,12 @@ impl ConversationRuntime for FakeRuntime {
         content: &str,
         _kernel_ctx: Option<&KernelContext>,
     ) -> CliResult<()> {
-        #[cfg(feature = "memory-sqlite")]
-        if let Some(config) = self.durable_memory_config.as_ref() {
-            crate::memory::append_turn_direct(session_id, role, content, config)
-                .map_err(|error| format!("persist {role} turn failed: {error}"))?;
-        }
         self.persisted.lock().expect("persist lock").push((
             session_id.to_owned(),
             role.to_owned(),
             content.to_owned(),
         ));
         Ok(())
-    }
-
-    async fn after_turn(
-        &self,
-        session_id: &str,
-        user_input: &str,
-        assistant_reply: &str,
-        messages: &[Value],
-        _kernel_ctx: Option<&KernelContext>,
-    ) -> CliResult<()> {
-        self.after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .push((
-                session_id.to_owned(),
-                user_input.to_owned(),
-                assistant_reply.to_owned(),
-                messages.len(),
-            ));
-        self.after_turn_result.clone()
-    }
-
-    async fn compact_context(
-        &self,
-        _config: &LoongClawConfig,
-        session_id: &str,
-        messages: &[Value],
-        _kernel_ctx: Option<&KernelContext>,
-    ) -> CliResult<()> {
-        self.compact_calls
-            .lock()
-            .expect("compact lock")
-            .push((session_id.to_owned(), messages.len()));
-        self.compact_result.clone()
     }
 }
 
@@ -730,241 +149,68 @@ fn test_config() -> LoongClawConfig {
         cli: CliChannelConfig::default(),
         telegram: TelegramChannelConfig::default(),
         feishu: FeishuChannelConfig::default(),
+        feishu_integration: crate::config::FeishuIntegrationConfig::default(),
         conversation: ConversationConfig::default(),
         tools: ToolConfig::default(),
         external_skills: ExternalSkillsConfig::default(),
         memory: MemoryConfig::default(),
-        acp: crate::config::AcpConfig::default(),
     }
 }
 
-#[tokio::test]
-async fn default_runtime_supports_injected_context_engine() {
-    let runtime = DefaultConversationRuntime::with_context_engine(StubContextEngine);
-    let messages = runtime
-        .build_messages(&test_config(), "session-injected", true, None)
-        .await
-        .expect("build messages via injected context engine");
+fn build_echo_tool_kernel_context() -> KernelContext {
+    struct EchoPayloadToolAdapter;
 
-    assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0]["role"], "system");
-    assert_eq!(messages[0]["content"], "stub-context-engine");
-}
+    #[async_trait]
+    impl loongclaw_kernel::CoreToolAdapter for EchoPayloadToolAdapter {
+        fn name(&self) -> &str {
+            "echo-payload-tools"
+        }
 
-#[tokio::test]
-async fn default_runtime_can_resolve_context_engine_from_registry() {
-    register_context_engine("stub-registry", || Box::new(StubContextEngine))
-        .expect("register context engine");
-    let runtime = DefaultConversationRuntime::from_engine_id(Some("stub-registry"))
-        .expect("resolve context engine from registry");
-    let messages = runtime
-        .build_messages(&test_config(), "session-registry", true, None)
-        .await
-        .expect("build messages via registry context engine");
+        async fn execute_core_tool(
+            &self,
+            request: loongclaw_contracts::ToolCoreRequest,
+        ) -> Result<loongclaw_contracts::ToolCoreOutcome, loongclaw_contracts::ToolPlaneError>
+        {
+            Ok(loongclaw_contracts::ToolCoreOutcome {
+                status: "ok".to_owned(),
+                payload: json!({
+                    "tool": request.tool_name,
+                    "input": request.payload,
+                }),
+            })
+        }
+    }
 
-    assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0]["content"], "stub-context-engine");
-}
+    let audit = Arc::new(InMemoryAuditSink::default());
+    let clock = Arc::new(FixedClock::new(1_700_000_000));
+    let mut kernel = LoongClawKernel::with_runtime(StaticPolicyEngine::default(), clock, audit);
 
-#[tokio::test]
-#[allow(clippy::await_holding_lock)] // env var mutation is process-global; keep lock for full test body.
-async fn default_runtime_prefers_configured_context_engine_when_env_not_set() {
-    let _env_lock = context_engine_env_lock().lock().expect("env lock");
-    register_context_engine("stub-config", || Box::new(StubContextEngine))
-        .expect("register context engine");
-    let _scoped_env = ScopedEnvVar::set(CONTEXT_ENGINE_ENV, "");
-    let mut config = test_config();
-    config.conversation.context_engine = Some("stub-config".to_owned());
+    let pack = VerticalPackManifest {
+        pack_id: "test-pack".to_owned(),
+        domain: "testing".to_owned(),
+        version: "0.1.0".to_owned(),
+        default_route: ExecutionRoute {
+            harness_kind: HarnessKind::EmbeddedPi,
+            adapter: None,
+        },
+        allowed_connectors: BTreeSet::new(),
+        granted_capabilities: BTreeSet::from([Capability::InvokeTool]),
+        metadata: BTreeMap::new(),
+    };
+    kernel.register_pack(pack).expect("register pack");
+    kernel.register_core_tool_adapter(EchoPayloadToolAdapter);
+    kernel
+        .set_default_core_tool_adapter("echo-payload-tools")
+        .expect("set default adapter");
 
-    let runtime = DefaultConversationRuntime::from_config_or_env(&config)
-        .expect("resolve context engine from config");
-    let messages = runtime
-        .build_messages(&config, "session-config", true, None)
-        .await
-        .expect("build messages via configured context engine");
+    let token = kernel
+        .issue_token("test-pack", "test-agent", 3600)
+        .expect("issue token");
 
-    assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0]["content"], "stub-context-engine");
-}
-
-#[test]
-fn default_runtime_exposes_context_engine_metadata() {
-    let runtime = DefaultConversationRuntime::default();
-    let metadata = runtime.context_engine_metadata();
-    assert_eq!(metadata.id, DEFAULT_CONTEXT_ENGINE_ID);
-    assert_eq!(metadata.api_version, CONTEXT_ENGINE_API_VERSION);
-}
-
-#[tokio::test]
-async fn default_runtime_delegates_bootstrap_and_ingest_to_context_engine() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let runtime =
-        DefaultConversationRuntime::with_context_engine(RecordingLifecycleContextEngine {
-            calls: calls.clone(),
-        });
-
-    let bootstrap = runtime
-        .bootstrap(&test_config(), "session-lifecycle", None)
-        .await
-        .expect("bootstrap should delegate to context engine");
-    let ingest = runtime
-        .ingest(
-            "session-lifecycle",
-            &json!({
-                "role": "user",
-                "content": "hello",
-            }),
-            None,
-        )
-        .await
-        .expect("ingest should delegate to context engine");
-
-    assert!(bootstrap.bootstrapped);
-    assert!(ingest.ingested);
-    assert_eq!(
-        calls.lock().expect("recording calls lock").clone(),
-        vec![
-            "bootstrap:session-lifecycle".to_owned(),
-            "ingest:session-lifecycle:user".to_owned(),
-        ]
-    );
-}
-
-#[tokio::test]
-async fn default_runtime_delegates_subagent_lifecycle_to_context_engine() {
-    let calls = Arc::new(Mutex::new(Vec::new()));
-    let runtime =
-        DefaultConversationRuntime::with_context_engine(RecordingLifecycleContextEngine {
-            calls: calls.clone(),
-        });
-
-    runtime
-        .prepare_subagent_spawn("session-parent", "session-child", None)
-        .await
-        .expect("prepare_subagent_spawn should delegate to context engine");
-    runtime
-        .on_subagent_ended("session-parent", "session-child", None)
-        .await
-        .expect("on_subagent_ended should delegate to context engine");
-
-    assert_eq!(
-        calls.lock().expect("recording calls lock").clone(),
-        vec![
-            "prepare_subagent_spawn:session-parent:session-child".to_owned(),
-            "on_subagent_ended:session-parent:session-child".to_owned(),
-        ]
-    );
-}
-
-#[tokio::test]
-async fn default_runtime_build_context_applies_system_prompt_addition() {
-    let runtime = DefaultConversationRuntime::with_context_engine(StubSystemPromptAdditionEngine);
-    let assembled = runtime
-        .build_context(&test_config(), "session-system-addition", true, None)
-        .await
-        .expect("build context with system prompt addition");
-
-    assert_eq!(assembled.estimated_tokens, Some(42));
-    assert_eq!(
-        assembled.system_prompt_addition.as_deref(),
-        Some("runtime-policy-addition")
-    );
-    assert_eq!(assembled.messages.len(), 1);
-    assert_eq!(assembled.messages[0]["role"], "system");
-    let merged = assembled.messages[0]["content"]
-        .as_str()
-        .expect("system prompt should stay string");
-    assert_eq!(
-        merged, "runtime-policy-addition\n\nbase-system-prompt",
-        "system prompt addition should be prepended"
-    );
-}
-
-#[test]
-fn resolve_context_engine_selection_uses_default_when_unset() {
-    let _env_lock = context_engine_env_lock().lock().expect("env lock");
-    let _scoped_env = ScopedEnvVar::set(CONTEXT_ENGINE_ENV, "");
-    let config = test_config();
-    let selection = resolve_context_engine_selection(&config);
-    assert_eq!(selection.id, DEFAULT_CONTEXT_ENGINE_ID);
-    assert_eq!(selection.source, ContextEngineSelectionSource::Default);
-    assert_eq!(selection.source.as_str(), "default");
-}
-
-#[test]
-fn resolve_context_engine_selection_prefers_env_over_config() {
-    let _env_lock = context_engine_env_lock().lock().expect("env lock");
-    let _scoped_env = ScopedEnvVar::set(CONTEXT_ENGINE_ENV, "stub-env-priority");
-    let mut config = test_config();
-    config.conversation.context_engine = Some("stub-config".to_owned());
-
-    let selection = resolve_context_engine_selection(&config);
-    assert_eq!(selection.id, "stub-env-priority");
-    assert_eq!(selection.source, ContextEngineSelectionSource::Env);
-}
-
-#[test]
-fn resolve_context_engine_selection_uses_config_when_env_missing() {
-    let _env_lock = context_engine_env_lock().lock().expect("env lock");
-    let _scoped_env = ScopedEnvVar::set(CONTEXT_ENGINE_ENV, "");
-    let mut config = test_config();
-    config.conversation.context_engine = Some("legacy".to_owned());
-
-    let selection = resolve_context_engine_selection(&config);
-    assert_eq!(selection.id, "legacy");
-    assert_eq!(selection.source, ContextEngineSelectionSource::Config);
-}
-
-#[test]
-fn collect_context_engine_runtime_snapshot_reports_compaction_and_selection() {
-    let _env_lock = context_engine_env_lock().lock().expect("env lock");
-    let _scoped_env = ScopedEnvVar::set(CONTEXT_ENGINE_ENV, "");
-    let mut config = test_config();
-    config.conversation.compact_enabled = true;
-    config.conversation.compact_min_messages = Some(7);
-    config.conversation.compact_fail_open = false;
-
-    let snapshot = collect_context_engine_runtime_snapshot(&config)
-        .expect("collect context engine runtime snapshot");
-    assert_eq!(snapshot.selected.id, DEFAULT_CONTEXT_ENGINE_ID);
-    assert_eq!(
-        snapshot.selected.source,
-        ContextEngineSelectionSource::Default
-    );
-    assert_eq!(snapshot.selected_metadata.id, DEFAULT_CONTEXT_ENGINE_ID);
-    assert!(
-        snapshot
-            .available
-            .iter()
-            .any(|metadata| metadata.id == DEFAULT_CONTEXT_ENGINE_ID)
-    );
-    assert_eq!(snapshot.compaction.min_messages, Some(7));
-    assert_eq!(snapshot.compaction.trigger_estimated_tokens, None);
-    assert!(!snapshot.compaction.fail_open);
-}
-
-#[tokio::test]
-#[allow(clippy::await_holding_lock)] // env var mutation is process-global; keep lock for full test body.
-async fn default_runtime_prefers_env_context_engine_over_config() {
-    let _env_lock = context_engine_env_lock().lock().expect("env lock");
-    register_context_engine("stub-config-env-priority", || Box::new(StubContextEngine))
-        .expect("register config context engine");
-    register_context_engine("stub-env-priority", || Box::new(StubEnvContextEngine))
-        .expect("register env context engine");
-    let _scoped_env = ScopedEnvVar::set(CONTEXT_ENGINE_ENV, "stub-env-priority");
-
-    let mut config = test_config();
-    config.conversation.context_engine = Some("stub-config-env-priority".to_owned());
-
-    let runtime = DefaultConversationRuntime::from_config_or_env(&config)
-        .expect("resolve context engine from env override");
-    let messages = runtime
-        .build_messages(&config, "session-env-priority", true, None)
-        .await
-        .expect("build messages via env-selected context engine");
-
-    assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0]["content"], "stub-env-context-engine");
+    KernelContext {
+        kernel: Arc::new(kernel),
+        token,
+    }
 }
 
 #[tokio::test]
@@ -987,25 +233,16 @@ async fn handle_turn_with_runtime_success_persists_user_and_assistant_turns() {
         .expect("handle turn success");
 
     assert_eq!(reply, "assistant-reply");
-    assert_eq!(
-        runtime
-            .bootstrap_calls
-            .lock()
-            .expect("bootstrap lock")
-            .as_slice(),
-        ["session-1"]
-    );
 
     let requested = runtime.requested_messages.lock().expect("requested lock");
     assert_eq!(requested.len(), 2);
     assert_eq!(requested[1]["role"], "user");
     assert_eq!(requested[1]["content"], "hello");
 
-    let persisted = runtime.persisted.lock().expect("persisted lock").clone();
-    let visible_turns = persisted_visible_turns(&persisted);
-    assert_eq!(visible_turns.len(), 2);
+    let persisted = runtime.persisted.lock().expect("persisted lock");
+    assert_eq!(persisted.len(), 2);
     assert_eq!(
-        visible_turns[0],
+        persisted[0],
         (
             "session-1".to_owned(),
             "user".to_owned(),
@@ -1013,115 +250,368 @@ async fn handle_turn_with_runtime_success_persists_user_and_assistant_turns() {
         )
     );
     assert_eq!(
-        visible_turns[1],
+        persisted[1],
         (
             "session-1".to_owned(),
             "assistant".to_owned(),
             "assistant-reply".to_owned(),
         )
     );
-
-    let ingested = runtime
-        .ingested_messages
-        .lock()
-        .expect("ingest lock")
-        .clone();
-    assert_eq!(ingested.len(), 2);
-    assert_eq!(ingested[0].0, "session-1");
-    assert_eq!(ingested[0].1["role"], "user");
-    assert_eq!(ingested[0].1["content"], "hello");
-    assert_eq!(ingested[1].0, "session-1");
-    assert_eq!(ingested[1].1["role"], "assistant");
-    assert_eq!(ingested[1].1["content"], "assistant-reply");
-
-    let after_turn = runtime
-        .after_turn_calls
-        .lock()
-        .expect("after-turn lock")
-        .clone();
-    assert_eq!(after_turn.len(), 1);
-    assert_eq!(after_turn[0].0, "session-1");
-    assert_eq!(after_turn[0].1, "hello");
-    assert_eq!(after_turn[0].2, "assistant-reply");
-    assert_eq!(after_turn[0].3, 3);
-
-    let compact = runtime.compact_calls.lock().expect("compact lock").clone();
-    assert_eq!(compact.len(), 1);
-    assert_eq!(compact[0].0, "session-1");
-    assert_eq!(compact[0].1, 3);
 }
 
 #[tokio::test]
-async fn handle_turn_with_runtime_keeps_provider_path_by_default_when_acp_enabled() {
-    let (backend_id, shared) = register_routed_acp_backend("success", false);
+async fn handle_turn_with_runtime_and_ingress_injects_system_note_and_persists_event() {
     let runtime = FakeRuntime::new(
         vec![json!({"role": "system", "content": "sys"})],
-        Ok("provider-normal-path".to_owned()),
+        Ok("assistant-reply".to_owned()),
     );
     let coordinator = ConversationTurnCoordinator::new();
-    let mut config = test_config();
-    config.acp.enabled = true;
-    config.acp.default_agent = Some("claude".to_owned());
-    config.acp.allowed_agents = vec!["claude".to_owned()];
-    config.acp.backend = Some(backend_id.to_owned());
-    config.acp.bindings_enabled = true;
-    config.acp.dispatch.bootstrap_mcp_servers =
-        vec![" Filesystem ".to_owned(), "filesystem".to_owned()];
-    config.memory.sqlite_path = unique_acp_sqlite_path("success");
+    let ingress = ConversationIngressContext {
+        channel: ConversationIngressChannel {
+            platform: "feishu".to_owned(),
+            configured_account_id: Some("work".to_owned()),
+            account_id: Some("lark_cli_a1b2c3".to_owned()),
+            conversation_id: "oc_123".to_owned(),
+            participant_id: Some("ou_sender_1".to_owned()),
+            thread_id: Some("om_root_1".to_owned()),
+        },
+        delivery: ConversationIngressDelivery {
+            source_message_id: Some("om_message_9".to_owned()),
+            sender_identity_key: Some("feishu:user:ou_sender_1".to_owned()),
+            thread_root_id: Some("om_root_1".to_owned()),
+            parent_message_id: Some("om_parent_1".to_owned()),
+            resources: vec![ConversationIngressDeliveryResource {
+                resource_type: "file".to_owned(),
+                file_key: "file_v2_123".to_owned(),
+                file_name: Some("report.pdf".to_owned()),
+            }],
+        },
+        private: Default::default(),
+    };
 
     let reply = coordinator
-        .handle_turn_with_runtime(
-            &config,
-            "telegram:42",
-            "hello from channel",
+        .handle_turn_with_runtime_and_ingress(
+            &test_config(),
+            "session-ingress",
+            "hello",
             ProviderErrorMode::Propagate,
             &runtime,
             None,
+            Some(&ingress),
         )
         .await
-        .expect("default handle_turn should stay on provider path");
+        .expect("turn with ingress should succeed");
 
-    assert_eq!(reply, "provider-normal-path");
-    assert_eq!(*runtime.turn_calls.lock().expect("turn calls lock"), 1);
-    assert_eq!(shared.lock().expect("ACP shared state").turn_calls, 0);
+    assert_eq!(reply, "assistant-reply");
+
+    let requested = runtime.requested_messages.lock().expect("requested lock");
+    assert_eq!(requested.len(), 3);
+    assert_eq!(requested[0]["role"], "system");
+    assert_eq!(requested[1]["role"], "system");
+    let ingress_note = requested[1]["content"]
+        .as_str()
+        .expect("ingress note should be a string");
+    assert!(
+        ingress_note.contains("[conversation_ingress]"),
+        "expected ingress marker in system note, got: {ingress_note}"
+    );
+    assert!(
+        ingress_note.contains("\"platform\":\"feishu\""),
+        "expected platform metadata in system note, got: {ingress_note}"
+    );
+    assert!(
+        ingress_note.contains("\"configured_account_id\":\"work\""),
+        "expected configured account metadata in system note, got: {ingress_note}"
+    );
+    assert!(
+        ingress_note.contains("\"participant_id\":\"ou_sender_1\""),
+        "expected participant metadata in system note, got: {ingress_note}"
+    );
+    assert!(
+        ingress_note.contains("\"sender_identity_key\":\"feishu:user:ou_sender_1\""),
+        "expected sender identity metadata in system note, got: {ingress_note}"
+    );
+    assert!(
+        ingress_note.contains("\"thread_root_id\":\"om_root_1\""),
+        "expected thread root metadata in system note, got: {ingress_note}"
+    );
+    assert!(
+        ingress_note.contains("\"resources\":[{"),
+        "expected resource metadata in system note, got: {ingress_note}"
+    );
+    assert!(
+        ingress_note.contains("\"file_key\":\"file_v2_123\""),
+        "expected resource key metadata in system note, got: {ingress_note}"
+    );
+    assert!(
+        ingress_note.contains("\"type\":\"file\""),
+        "expected resource type metadata in system note, got: {ingress_note}"
+    );
+    assert_eq!(requested[2]["role"], "user");
+    assert_eq!(requested[2]["content"], "hello");
+
+    let persisted = runtime.persisted.lock().expect("persisted lock");
+    assert_eq!(persisted.len(), 3);
+    assert_eq!(persisted[0].0, "session-ingress");
+    assert_eq!(persisted[0].1, "assistant");
+    let ingress_event =
+        serde_json::from_str::<Value>(&persisted[0].2).expect("ingress event should be valid json");
+    assert_eq!(ingress_event["type"], "conversation_event");
+    assert_eq!(ingress_event["event"], "turn_ingress");
+    assert_eq!(ingress_event["payload"]["channel"]["platform"], "feishu");
+    assert_eq!(
+        ingress_event["payload"]["channel"]["configured_account_id"],
+        "work"
+    );
+    assert_eq!(
+        ingress_event["payload"]["channel"]["participant_id"],
+        "ou_sender_1"
+    );
+    assert_eq!(
+        ingress_event["payload"]["delivery"]["sender_identity_key"],
+        "feishu:user:ou_sender_1"
+    );
+    assert_eq!(
+        ingress_event["payload"]["delivery"]["thread_root_id"],
+        "om_root_1"
+    );
+    assert_eq!(
+        ingress_event["payload"]["delivery"]["resources"],
+        json!([{
+            "type": "file",
+            "file_key": "file_v2_123",
+            "file_name": "report.pdf"
+        }])
+    );
+    assert_eq!(
+        persisted[1],
+        (
+            "session-ingress".to_owned(),
+            "user".to_owned(),
+            "hello".to_owned()
+        )
+    );
+    assert_eq!(
+        persisted[2],
+        (
+            "session-ingress".to_owned(),
+            "assistant".to_owned(),
+            "assistant-reply".to_owned(),
+        )
+    );
 }
 
-#[tokio::test]
-async fn handle_turn_with_runtime_routes_explicit_acp_turns_through_acp() {
-    let (backend_id, shared) = register_routed_acp_backend("success-explicit", false);
-    let runtime = FakeRuntime::new(
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_engine_execute_turn_with_ingress_injects_internal_context_for_feishu_send() {
+    let ctx = build_echo_tool_kernel_context();
+    let engine = TurnEngine::new(1);
+    let ingress = ConversationIngressContext {
+        channel: ConversationIngressChannel {
+            platform: "feishu".to_owned(),
+            configured_account_id: Some("work".to_owned()),
+            account_id: Some("feishu_main".to_owned()),
+            conversation_id: "oc_turn_engine".to_owned(),
+            participant_id: Some("ou_sender_engine".to_owned()),
+            thread_id: Some("om_thread_engine".to_owned()),
+        },
+        delivery: ConversationIngressDelivery {
+            source_message_id: Some("om_source_engine".to_owned()),
+            sender_identity_key: Some("feishu:user:ou_sender_engine".to_owned()),
+            thread_root_id: Some("om_thread_engine".to_owned()),
+            parent_message_id: Some("om_parent_engine".to_owned()),
+            resources: Vec::new(),
+        },
+        private: Default::default(),
+    };
+    let turn = ProviderTurn {
+        assistant_text: String::new(),
+        tool_intents: vec![ToolIntent {
+            tool_name: "feishu_messages_send".to_owned(),
+            args_json: json!({
+                "text": "hello from engine"
+            }),
+            source: "provider_tool_call".to_owned(),
+            session_id: "s-engine".to_owned(),
+            turn_id: "t-engine".to_owned(),
+            tool_call_id: "c-engine".to_owned(),
+        }],
+        raw_meta: Value::Null,
+    };
+
+    let result = engine
+        .execute_turn_with_ingress(&turn, Some(&ctx), Some(&ingress))
+        .await;
+
+    match result {
+        TurnResult::FinalText(text) => {
+            let line = text.lines().next().expect("tool result line should exist");
+            let payload = line
+                .strip_prefix("[ok] ")
+                .expect("tool result line should keep [ok] prefix");
+            let envelope: Value =
+                serde_json::from_str(payload).expect("tool result envelope should be json");
+            let summary = envelope["payload_summary"]
+                .as_str()
+                .expect("payload summary should be string");
+
+            assert!(summary.contains("\"_loongclaw\""), "summary={summary}");
+            assert!(
+                summary.contains("\"conversation_id\":\"oc_turn_engine\""),
+                "summary={summary}"
+            );
+            assert!(
+                summary.contains("\"configured_account_id\":\"work\""),
+                "summary={summary}"
+            );
+            assert!(
+                summary.contains("\"source_message_id\":\"om_source_engine\""),
+                "summary={summary}"
+            );
+            assert!(
+                summary.contains("\"text\":\"hello from engine\""),
+                "summary={summary}"
+            );
+        }
+        other => panic!("expected FinalText, got {:?}", other),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_engine_execute_turn_with_ingress_injects_internal_context_for_feishu_get() {
+    let ctx = build_echo_tool_kernel_context();
+    let engine = TurnEngine::new(1);
+    let ingress = ConversationIngressContext {
+        channel: ConversationIngressChannel {
+            platform: "feishu".to_owned(),
+            configured_account_id: Some("work".to_owned()),
+            account_id: Some("feishu_main".to_owned()),
+            conversation_id: "oc_turn_get".to_owned(),
+            participant_id: Some("ou_sender_get".to_owned()),
+            thread_id: Some("om_thread_get".to_owned()),
+        },
+        delivery: ConversationIngressDelivery {
+            source_message_id: Some("om_source_get".to_owned()),
+            sender_identity_key: Some("feishu:user:ou_sender_get".to_owned()),
+            thread_root_id: Some("om_thread_get".to_owned()),
+            parent_message_id: Some("om_parent_get".to_owned()),
+            resources: vec![ConversationIngressDeliveryResource {
+                resource_type: "image".to_owned(),
+                file_key: "img_v2_get".to_owned(),
+                file_name: None,
+            }],
+        },
+        private: Default::default(),
+    };
+    let turn = ProviderTurn {
+        assistant_text: String::new(),
+        tool_intents: vec![ToolIntent {
+            tool_name: "feishu_messages_get".to_owned(),
+            args_json: json!({}),
+            source: "provider_tool_call".to_owned(),
+            session_id: "s-get".to_owned(),
+            turn_id: "t-get".to_owned(),
+            tool_call_id: "c-get".to_owned(),
+        }],
+        raw_meta: Value::Null,
+    };
+
+    let result = engine
+        .execute_turn_with_ingress(&turn, Some(&ctx), Some(&ingress))
+        .await;
+
+    match result {
+        TurnResult::FinalText(text) => {
+            let line = text.lines().next().expect("tool result line should exist");
+            let payload = line
+                .strip_prefix("[ok] ")
+                .expect("tool result line should keep [ok] prefix");
+            let envelope: Value =
+                serde_json::from_str(payload).expect("tool result envelope should be json");
+            let summary = envelope["payload_summary"]
+                .as_str()
+                .expect("payload summary should be string");
+
+            assert!(summary.contains("\"_loongclaw\""), "summary={summary}");
+            assert!(
+                summary.contains("\"conversation_id\":\"oc_turn_get\""),
+                "summary={summary}"
+            );
+            assert!(
+                summary.contains("\"configured_account_id\":\"work\""),
+                "summary={summary}"
+            );
+            assert!(
+                summary.contains("\"source_message_id\":\"om_source_get\""),
+                "summary={summary}"
+            );
+            assert!(summary.contains("\"resources\":[{"), "summary={summary}");
+            assert!(
+                summary.contains("\"file_key\":\"img_v2_get\""),
+                "summary={summary}"
+            );
+            assert!(summary.contains("\"type\":\"image\""), "summary={summary}");
+        }
+        other => panic!("expected FinalText, got {:?}", other),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handle_turn_with_runtime_and_ingress_safe_lane_injects_internal_context_into_tool_payload()
+{
+    let runtime = FakeRuntime::with_turn_and_completion(
         vec![json!({"role": "system", "content": "sys"})],
-        Ok("provider-should-not-run".to_owned()),
+        Ok(ProviderTurn {
+            assistant_text: String::new(),
+            tool_intents: vec![ToolIntent {
+                tool_name: "feishu_messages_reply".to_owned(),
+                args_json: json!({
+                    "text": "hello from safe lane"
+                }),
+                source: "provider_tool_call".to_owned(),
+                session_id: "s-safe".to_owned(),
+                turn_id: "t-safe".to_owned(),
+                tool_call_id: "c-safe".to_owned(),
+            }],
+            raw_meta: Value::Null,
+        }),
+        Ok("unused".to_owned()),
     );
     let coordinator = ConversationTurnCoordinator::new();
+    let ctx = build_echo_tool_kernel_context();
+    let ingress = ConversationIngressContext {
+        channel: ConversationIngressChannel {
+            platform: "feishu".to_owned(),
+            configured_account_id: Some("safe".to_owned()),
+            account_id: Some("feishu_safe".to_owned()),
+            conversation_id: "oc_safe_lane".to_owned(),
+            participant_id: Some("ou_sender_safe".to_owned()),
+            thread_id: Some("om_thread_safe".to_owned()),
+        },
+        delivery: ConversationIngressDelivery {
+            source_message_id: Some("om_source_safe".to_owned()),
+            sender_identity_key: Some("feishu:user:ou_sender_safe".to_owned()),
+            thread_root_id: Some("om_thread_safe".to_owned()),
+            parent_message_id: Some("om_parent_safe".to_owned()),
+            resources: Vec::new(),
+        },
+        private: Default::default(),
+    };
     let mut config = test_config();
-    config.acp.enabled = true;
-    config.acp.default_agent = Some("claude".to_owned());
-    config.acp.allowed_agents = vec!["claude".to_owned()];
-    config.acp.backend = Some(backend_id.to_owned());
-    config.acp.bindings_enabled = true;
-    config.acp.dispatch.bootstrap_mcp_servers =
-        vec![" Filesystem ".to_owned(), "filesystem".to_owned()];
-    config.memory.sqlite_path = unique_acp_sqlite_path("success-explicit");
+    config.conversation.safe_lane_plan_execution_enabled = true;
 
     let reply = coordinator
-        .handle_turn_with_runtime_and_address_and_acp_options(
+        .handle_turn_with_runtime_and_ingress(
             &config,
-            &ConversationSessionAddress::from_session_id("telegram:42"),
-            "hello from channel",
+            "session-safe-ingress-tool",
+            "show raw tool output before delete production token",
             ProviderErrorMode::Propagate,
             &runtime,
-            &AcpConversationTurnOptions {
-                routing_intent: AcpRoutingIntent::Explicit,
-                ..AcpConversationTurnOptions::default()
-            },
-            None,
+            Some(&ctx),
+            Some(&ingress),
         )
         .await
-        .expect("explicit ACP turn should route through ACP");
+        .expect("safe lane tool turn should succeed");
 
-    assert_eq!(reply, "acp: hello from channel");
-    assert_eq!(*runtime.turn_calls.lock().expect("turn calls lock"), 0);
     assert_eq!(
         *runtime
             .completion_calls
@@ -1129,1470 +619,37 @@ async fn handle_turn_with_runtime_routes_explicit_acp_turns_through_acp() {
             .expect("completion calls lock"),
         0
     );
-    assert!(
-        runtime
-            .requested_messages
-            .lock()
-            .expect("requested messages lock")
-            .is_empty(),
-        "provider path should not build or request provider messages for explicit ACP turns"
-    );
+    let line = reply.lines().next().expect("tool result line should exist");
+    let payload = line
+        .strip_prefix("[ok] ")
+        .expect("tool result line should keep [ok] prefix");
+    let envelope: Value =
+        serde_json::from_str(payload).expect("tool result envelope should be json");
+    let summary = envelope["payload_summary"]
+        .as_str()
+        .expect("payload summary should be string");
 
-    let persisted = runtime.persisted.lock().expect("persisted lock").clone();
-    assert_eq!(persisted.len(), 2);
-    assert_eq!(persisted[0].0, "telegram:42");
-    assert_eq!(persisted[0].1, "user");
-    assert_eq!(persisted[1].1, "assistant");
-    assert_eq!(persisted[1].2, "acp: hello from channel");
+    assert!(summary.contains("\"_loongclaw\""), "summary={summary}");
     assert!(
-        runtime
-            .bootstrap_calls
-            .lock()
-            .expect("bootstrap lock")
-            .is_empty()
+        summary.contains("\"source_message_id\":\"om_source_safe\""),
+        "summary={summary}"
     );
     assert!(
-        runtime
-            .ingested_messages
-            .lock()
-            .expect("ingest lock")
-            .is_empty()
+        summary.contains("\"configured_account_id\":\"safe\""),
+        "summary={summary}"
     );
     assert!(
-        runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .is_empty()
+        summary.contains("\"account_id\":\"feishu_safe\""),
+        "summary={summary}"
     );
     assert!(
-        runtime
-            .compact_calls
-            .lock()
-            .expect("compact lock")
-            .is_empty()
-    );
-
-    let state = shared.lock().expect("ACP shared state");
-    assert_eq!(state.ensure_calls, 1);
-    assert_eq!(state.turn_calls, 1);
-    let bootstrap = state
-        .last_bootstrap
-        .clone()
-        .expect("ACP bootstrap should be captured");
-    assert_eq!(bootstrap.conversation_id.as_deref(), Some("telegram:42"));
-    assert_eq!(
-        bootstrap
-            .binding
-            .as_ref()
-            .map(|binding| binding.route_session_id.as_str()),
-        Some("telegram:42")
-    );
-    assert_eq!(bootstrap.session_key, "agent:claude:telegram:42");
-    assert_eq!(bootstrap.mcp_servers, vec!["filesystem".to_owned()]);
-    assert_eq!(
-        bootstrap.metadata.get("acp_agent").map(String::as_str),
-        Some("claude")
-    );
-    assert_eq!(
-        bootstrap
-            .metadata
-            .get("loongclaw.acp.activation_origin")
-            .map(String::as_str),
-        Some("explicit_request")
-    );
-    let request = state
-        .last_request
-        .clone()
-        .expect("ACP request should be captured");
-    assert_eq!(request.session_key, "agent:claude:telegram:42");
-    assert_eq!(request.input, "hello from channel");
-    assert_eq!(
-        request
-            .metadata
-            .get("loongclaw.acp.routing_origin")
-            .map(String::as_str),
-        Some("explicit_request")
+        summary.contains("\"text\":\"hello from safe lane\""),
+        "summary={summary}"
     );
 }
 
 #[tokio::test]
-async fn handle_turn_with_runtime_merges_additional_acp_bootstrap_mcp_servers_from_options() {
-    let (backend_id, shared) = register_routed_acp_backend("bootstrap-mcp-options", false);
-    let runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("provider-should-not-run".to_owned()),
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-    let mut config = test_config();
-    config.acp.enabled = true;
-    config.acp.default_agent = Some("claude".to_owned());
-    config.acp.allowed_agents = vec!["claude".to_owned()];
-    config.acp.backend = Some(backend_id.to_owned());
-    config.acp.dispatch.bootstrap_mcp_servers = vec![" Filesystem ".to_owned()];
-    config.memory.sqlite_path = unique_acp_sqlite_path("bootstrap-mcp-options");
-    let extra_servers = vec![
-        "search".to_owned(),
-        "filesystem".to_owned(),
-        " Search ".to_owned(),
-    ];
-
-    let reply = coordinator
-        .handle_turn_with_runtime_and_address_and_acp_options(
-            &config,
-            &ConversationSessionAddress::from_session_id("telegram:4242"),
-            "hello with extra bootstrap mcp",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            &AcpConversationTurnOptions {
-                routing_intent: AcpRoutingIntent::Explicit,
-                additional_bootstrap_mcp_servers: Some(extra_servers.as_slice()),
-                ..AcpConversationTurnOptions::default()
-            },
-            None,
-        )
-        .await
-        .expect("ACP-routed turn with additional bootstrap MCP servers should succeed");
-
-    assert_eq!(reply, "acp: hello with extra bootstrap mcp");
-    let state = shared.lock().expect("ACP shared state");
-    let bootstrap = state
-        .last_bootstrap
-        .clone()
-        .expect("ACP bootstrap should be captured");
-    assert_eq!(
-        bootstrap.mcp_servers,
-        vec!["filesystem".to_owned(), "search".to_owned()]
-    );
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_applies_acp_turn_provenance_metadata() {
-    let (backend_id, shared) = register_routed_acp_backend("turn-provenance", false);
-    let runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("provider-should-not-run".to_owned()),
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-    let mut config = test_config();
-    config.acp.enabled = true;
-    config.acp.default_agent = Some("claude".to_owned());
-    config.acp.allowed_agents = vec!["claude".to_owned()];
-    config.acp.backend = Some(backend_id.to_owned());
-    config.memory.sqlite_path = unique_acp_sqlite_path("turn-provenance");
-
-    let reply = coordinator
-        .handle_turn_with_runtime_and_address_and_acp_options(
-            &config,
-            &ConversationSessionAddress::from_session_id("telegram:4242"),
-            "hello with provenance",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            &AcpConversationTurnOptions {
-                routing_intent: AcpRoutingIntent::Explicit,
-                provenance: AcpTurnProvenance {
-                    trace_id: Some("trace-123"),
-                    source_message_id: Some("message-42"),
-                    ack_cursor: Some("cursor-9"),
-                },
-                ..AcpConversationTurnOptions::default()
-            },
-            None,
-        )
-        .await
-        .expect("ACP-routed turn with provenance should succeed");
-
-    assert_eq!(reply, "acp: hello with provenance");
-    let state = shared.lock().expect("ACP shared state");
-    let request = state
-        .last_request
-        .clone()
-        .expect("ACP request should be captured");
-    assert_eq!(
-        request
-            .metadata
-            .get(ACP_TURN_METADATA_TRACE_ID)
-            .map(String::as_str),
-        Some("trace-123")
-    );
-    assert_eq!(
-        request
-            .metadata
-            .get(ACP_TURN_METADATA_SOURCE_MESSAGE_ID)
-            .map(String::as_str),
-        Some("message-42")
-    );
-    assert_eq!(
-        request
-            .metadata
-            .get(ACP_TURN_METADATA_ACK_CURSOR)
-            .map(String::as_str),
-        Some("cursor-9")
-    );
-    assert_eq!(
-        request
-            .metadata
-            .get(ACP_TURN_METADATA_ROUTING_INTENT)
-            .map(String::as_str),
-        Some("explicit")
-    );
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_applies_acp_working_directory_from_options() {
-    let (backend_id, shared) = register_routed_acp_backend("turn-working-directory", false);
-    let runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("provider-should-not-run".to_owned()),
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-    let mut config = test_config();
-    config.acp.enabled = true;
-    config.acp.default_agent = Some("claude".to_owned());
-    config.acp.allowed_agents = vec!["claude".to_owned()];
-    config.acp.backend = Some(backend_id.to_owned());
-    config.memory.sqlite_path = unique_acp_sqlite_path("turn-working-directory");
-    let working_directory = PathBuf::from("/workspace/project");
-
-    let reply = coordinator
-        .handle_turn_with_runtime_and_address_and_acp_options(
-            &config,
-            &ConversationSessionAddress::from_session_id("telegram:4242"),
-            "hello with working directory",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            &AcpConversationTurnOptions {
-                routing_intent: AcpRoutingIntent::Explicit,
-                working_directory: Some(working_directory.as_path()),
-                ..AcpConversationTurnOptions::default()
-            },
-            None,
-        )
-        .await
-        .expect("ACP-routed turn with working directory should succeed");
-
-    assert_eq!(reply, "acp: hello with working directory");
-    let state = shared.lock().expect("ACP shared state");
-    let bootstrap = state
-        .last_bootstrap
-        .clone()
-        .expect("ACP bootstrap should be captured");
-    let request = state
-        .last_request
-        .clone()
-        .expect("ACP request should be captured");
-    assert_eq!(
-        bootstrap.working_directory.as_deref(),
-        Some(working_directory.as_path())
-    );
-    assert_eq!(
-        request.working_directory.as_deref(),
-        Some(working_directory.as_path())
-    );
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_falls_back_to_dispatch_acp_working_directory() {
-    let (backend_id, shared) = register_routed_acp_backend("dispatch-working-directory", false);
-    let runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("provider-should-not-run".to_owned()),
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-    let mut config = test_config();
-    config.acp.enabled = true;
-    config.acp.default_agent = Some("claude".to_owned());
-    config.acp.allowed_agents = vec!["claude".to_owned()];
-    config.acp.backend = Some(backend_id.to_owned());
-    config.acp.dispatch.working_directory = Some(" /workspace/dispatch ".to_owned());
-    config.memory.sqlite_path = unique_acp_sqlite_path("dispatch-working-directory");
-
-    let reply = coordinator
-        .handle_turn_with_runtime_and_address_and_acp_options(
-            &config,
-            &ConversationSessionAddress::from_session_id("telegram:4343"),
-            "hello with dispatch working directory",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            &AcpConversationTurnOptions {
-                routing_intent: AcpRoutingIntent::Explicit,
-                ..AcpConversationTurnOptions::default()
-            },
-            None,
-        )
-        .await
-        .expect("ACP-routed turn should inherit dispatch working directory");
-
-    assert_eq!(reply, "acp: hello with dispatch working directory");
-    let state = shared.lock().expect("ACP shared state");
-    let bootstrap = state
-        .last_bootstrap
-        .clone()
-        .expect("ACP bootstrap should be captured");
-    let request = state
-        .last_request
-        .clone()
-        .expect("ACP request should be captured");
-    assert_eq!(
-        bootstrap.working_directory.as_deref(),
-        Some(std::path::Path::new("/workspace/dispatch"))
-    );
-    assert_eq!(
-        request.working_directory.as_deref(),
-        Some(std::path::Path::new("/workspace/dispatch"))
-    );
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_uses_provider_path_when_acp_dispatch_is_disabled() {
-    let (backend_id, shared) = register_routed_acp_backend("dispatch-disabled", false);
-    let runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("provider-path-reply".to_owned()),
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-    let mut config = test_config();
-    config.acp.enabled = true;
-    config.acp.backend = Some(backend_id.to_owned());
-    config.acp.dispatch.enabled = false;
-    config.memory.sqlite_path = unique_acp_sqlite_path("dispatch-disabled");
-
-    let reply = coordinator
-        .handle_turn_with_runtime(
-            &config,
-            "telegram:424242",
-            "hello provider path",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            None,
-        )
-        .await
-        .expect("provider path should remain available when ACP dispatch is disabled");
-
-    assert_eq!(reply, "provider-path-reply");
-    assert_eq!(
-        shared.lock().expect("ACP shared state").turn_calls,
-        0,
-        "ACP backend should not receive turns when dispatch is disabled"
-    );
-    assert_eq!(*runtime.turn_calls.lock().expect("turn calls lock"), 1);
-    assert_eq!(
-        runtime
-            .bootstrap_calls
-            .lock()
-            .expect("bootstrap lock")
-            .as_slice(),
-        ["telegram:424242"]
-    );
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_explicit_acp_request_bypasses_dispatch_gate() {
-    let (backend_id, shared) = register_routed_acp_backend("dispatch-disabled-explicit", false);
-    let runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("provider-should-not-run".to_owned()),
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-    let mut config = test_config();
-    config.acp.enabled = true;
-    config.acp.backend = Some(backend_id.to_owned());
-    config.acp.dispatch.enabled = false;
-    config.memory.sqlite_path = unique_acp_sqlite_path("dispatch-disabled-explicit");
-
-    let reply = coordinator
-        .handle_turn_with_runtime_and_address_and_acp_options(
-            &config,
-            &ConversationSessionAddress::from_session_id("telegram:424242"),
-            "hello explicit acp path",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            &AcpConversationTurnOptions {
-                routing_intent: AcpRoutingIntent::Explicit,
-                ..AcpConversationTurnOptions::default()
-            },
-            None,
-        )
-        .await
-        .expect("explicit ACP requests should bypass automatic dispatch gating");
-
-    assert_eq!(reply, "acp: hello explicit acp path");
-    assert_eq!(*runtime.turn_calls.lock().expect("turn calls lock"), 0);
-    assert_eq!(shared.lock().expect("ACP shared state").turn_calls, 1);
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_explicit_acp_request_fails_closed_when_acp_is_disabled() {
-    let runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("provider-should-not-run".to_owned()),
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-    let mut config = test_config();
-    config.acp.enabled = false;
-
-    let reply = coordinator
-        .handle_turn_with_runtime_and_address_and_acp_options(
-            &config,
-            &ConversationSessionAddress::from_session_id("telegram:424242"),
-            "hello explicit disabled acp path",
-            ProviderErrorMode::InlineMessage,
-            &runtime,
-            &AcpConversationTurnOptions {
-                routing_intent: AcpRoutingIntent::Explicit,
-                ..AcpConversationTurnOptions::default()
-            },
-            None,
-        )
-        .await
-        .expect("inline mode should synthesize a clear ACP-disabled reply");
-
-    assert_eq!(
-        reply,
-        format_provider_error_reply("ACP is disabled by policy (`acp.enabled=false`)")
-    );
-    assert_eq!(*runtime.turn_calls.lock().expect("turn calls lock"), 0);
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_routes_only_agent_prefixed_sessions_when_configured() {
-    let (backend_id, shared) = register_routed_acp_backend("prefixed-only", false);
-    let runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("provider-fallback".to_owned()),
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-    let mut config = test_config();
-    config.acp.enabled = true;
-    config.acp.backend = Some(backend_id.to_owned());
-    config.acp.dispatch.conversation_routing =
-        crate::config::AcpConversationRoutingMode::AgentPrefixedOnly;
-    config.memory.sqlite_path = unique_acp_sqlite_path("prefixed-only");
-
-    let non_prefixed = coordinator
-        .handle_turn_with_runtime(
-            &config,
-            "telegram:600",
-            "should stay on provider path",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            None,
-        )
-        .await
-        .expect("non-prefixed session should stay on provider path");
-    assert_eq!(non_prefixed, "provider-fallback");
-
-    let prefixed = coordinator
-        .handle_turn_with_runtime(
-            &config,
-            "agent:codex:review-thread",
-            "should route through ACP",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            None,
-        )
-        .await
-        .expect("prefixed session should route through ACP");
-    assert_eq!(prefixed, "acp: should route through ACP");
-
-    let state = shared.lock().expect("ACP shared state");
-    assert_eq!(state.turn_calls, 1);
-    let bootstrap = state
-        .last_bootstrap
-        .clone()
-        .expect("ACP bootstrap should be captured for prefixed session");
-    assert_eq!(
-        bootstrap
-            .metadata
-            .get("loongclaw.acp.activation_origin")
-            .map(String::as_str),
-        Some("automatic_agent_prefixed")
-    );
-    let request = state
-        .last_request
-        .clone()
-        .expect("ACP request should be captured for prefixed session");
-    assert_eq!(request.session_key, "agent:codex:review-thread");
-    assert_eq!(
-        request
-            .metadata
-            .get("loongclaw.acp.routing_origin")
-            .map(String::as_str),
-        Some("automatic_agent_prefixed")
-    );
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_routes_only_allowed_channels_into_acp() {
-    let (backend_id, shared) = register_routed_acp_backend("channel-allowlist", false);
-    let runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("provider-feishu-reply".to_owned()),
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-    let mut config = test_config();
-    config.acp.enabled = true;
-    config.acp.backend = Some(backend_id.to_owned());
-    config.acp.dispatch.conversation_routing = crate::config::AcpConversationRoutingMode::All;
-    config.acp.dispatch.allowed_channels = vec!["telegram".to_owned()];
-    config.memory.sqlite_path = unique_acp_sqlite_path("channel-allowlist");
-
-    let telegram = coordinator
-        .handle_turn_with_runtime(
-            &config,
-            "telegram:100",
-            "hello telegram",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            None,
-        )
-        .await
-        .expect("telegram session should route through ACP");
-    assert_eq!(telegram, "acp: hello telegram");
-
-    {
-        let state = shared.lock().expect("ACP shared state");
-        let bootstrap = state
-            .last_bootstrap
-            .clone()
-            .expect("ACP bootstrap should be captured for allowlisted channel session");
-        assert_eq!(
-            bootstrap
-                .metadata
-                .get("loongclaw.acp.activation_origin")
-                .map(String::as_str),
-            Some("automatic_dispatch")
-        );
-        let request = state
-            .last_request
-            .clone()
-            .expect("ACP request should be captured for allowlisted channel session");
-        assert_eq!(
-            request
-                .metadata
-                .get("loongclaw.acp.routing_origin")
-                .map(String::as_str),
-            Some("automatic_dispatch")
-        );
-    }
-
-    let feishu = coordinator
-        .handle_turn_with_runtime(
-            &config,
-            "feishu:oc_123",
-            "hello feishu",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            None,
-        )
-        .await
-        .expect("feishu session should stay on provider path");
-    assert_eq!(feishu, "provider-feishu-reply");
-
-    let state = shared.lock().expect("ACP shared state");
-    assert_eq!(state.turn_calls, 1);
-    let request = state
-        .last_request
-        .clone()
-        .expect("ACP request should exist for telegram session");
-    assert_eq!(request.session_key, "agent:codex:telegram:100");
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_and_address_routes_structured_channel_scope_into_acp() {
-    let (backend_id, shared) = register_routed_acp_backend("structured-channel-address", false);
-    let runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("provider-reply".to_owned()),
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-    let mut config = test_config();
-    config.acp.enabled = true;
-    config.acp.backend = Some(backend_id.to_owned());
-    config.acp.dispatch.conversation_routing = crate::config::AcpConversationRoutingMode::All;
-    config.acp.dispatch.allowed_channels = vec!["telegram".to_owned()];
-    config.memory.sqlite_path = unique_acp_sqlite_path("structured-channel-address");
-    let address = ConversationSessionAddress::from_session_id("opaque-session")
-        .with_channel_scope("telegram", "100");
-
-    let reply = coordinator
-        .handle_turn_with_runtime_and_address(
-            &config,
-            &address,
-            "hello structured route",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            None,
-        )
-        .await
-        .expect("structured channel address should route through ACP");
-
-    assert_eq!(reply, "acp: hello structured route");
-
-    let state = shared.lock().expect("ACP shared state");
-    assert_eq!(state.turn_calls, 1);
-    let request = state
-        .last_request
-        .clone()
-        .expect("ACP request should be captured");
-    let bootstrap = state
-        .last_bootstrap
-        .clone()
-        .expect("ACP bootstrap should be captured");
-    assert_eq!(request.session_key, "agent:codex:opaque-session");
-    assert_eq!(
-        bootstrap
-            .binding
-            .as_ref()
-            .map(|binding| binding.route_session_id.as_str()),
-        Some("telegram:100")
-    );
-    assert_eq!(
-        bootstrap
-            .binding
-            .as_ref()
-            .and_then(|binding| binding.channel_id.as_deref()),
-        Some("telegram")
-    );
-    assert_eq!(
-        request.metadata.get("channel").map(String::as_str),
-        Some("telegram")
-    );
-    assert_eq!(
-        request
-            .metadata
-            .get("channel_conversation_id")
-            .map(String::as_str),
-        Some("100")
-    );
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_and_address_enforces_account_and_thread_dispatch_scope() {
-    let (backend_id, shared) =
-        register_routed_acp_backend("structured-account-thread-scope", false);
-    let runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("provider-reply".to_owned()),
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-    let mut config = test_config();
-    config.acp.enabled = true;
-    config.acp.backend = Some(backend_id.to_owned());
-    config.acp.dispatch.conversation_routing = crate::config::AcpConversationRoutingMode::All;
-    config.acp.dispatch.allowed_channels = vec!["feishu".to_owned()];
-    config.acp.dispatch.allowed_account_ids = vec!["lark-prod".to_owned()];
-    config.acp.dispatch.thread_routing = crate::config::AcpDispatchThreadRoutingMode::ThreadOnly;
-    config.memory.sqlite_path = unique_acp_sqlite_path("structured-account-thread-scope");
-
-    let allowed = ConversationSessionAddress::from_session_id("opaque-session")
-        .with_channel_scope("feishu", "oc_123")
-        .with_account_id("lark-prod")
-        .with_thread_id("om_thread_1");
-    let blocked = ConversationSessionAddress::from_session_id("opaque-session-root")
-        .with_channel_scope("feishu", "oc_123")
-        .with_account_id("lark-prod");
-
-    let allowed_reply = coordinator
-        .handle_turn_with_runtime_and_address(
-            &config,
-            &allowed,
-            "hello allowed",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            None,
-        )
-        .await
-        .expect("thread-bound allowed address should route through ACP");
-    assert_eq!(allowed_reply, "acp: hello allowed");
-
-    let blocked_reply = coordinator
-        .handle_turn_with_runtime_and_address(
-            &config,
-            &blocked,
-            "hello blocked",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            None,
-        )
-        .await
-        .expect("root conversation should stay on provider path");
-    assert_eq!(blocked_reply, "provider-reply");
-
-    let state = shared.lock().expect("ACP shared state");
-    assert_eq!(state.turn_calls, 1);
-    let bootstrap = state
-        .last_bootstrap
-        .clone()
-        .expect("ACP bootstrap should be captured");
-    assert_eq!(
-        bootstrap
-            .binding
-            .as_ref()
-            .map(|binding| binding.route_session_id.as_str()),
-        Some("feishu:lark-prod:oc_123:om_thread_1")
-    );
-    assert_eq!(
-        bootstrap
-            .binding
-            .as_ref()
-            .and_then(|binding| binding.account_id.as_deref()),
-        Some("lark-prod")
-    );
-    assert_eq!(
-        bootstrap
-            .binding
-            .as_ref()
-            .and_then(|binding| binding.thread_id.as_deref()),
-        Some("om_thread_1")
-    );
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_formats_acp_errors_inline_when_requested() {
-    let (backend_id, shared) = register_routed_acp_backend("inline-error", true);
-    let runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("provider-should-not-run".to_owned()),
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-    let mut config = test_config();
-    config.acp.enabled = true;
-    config.acp.backend = Some(backend_id.to_owned());
-    config.memory.sqlite_path = unique_acp_sqlite_path("inline-error");
-
-    let reply = coordinator
-        .handle_turn_with_runtime_and_address_and_acp_options(
-            &config,
-            &ConversationSessionAddress::from_session_id("feishu:oc_123"),
-            "hello from feishu",
-            ProviderErrorMode::InlineMessage,
-            &runtime,
-            &AcpConversationTurnOptions {
-                routing_intent: AcpRoutingIntent::Explicit,
-                ..AcpConversationTurnOptions::default()
-            },
-            None,
-        )
-        .await
-        .expect("ACP inline error mode should synthesize a reply");
-
-    assert_eq!(
-        reply,
-        format_provider_error_reply("synthetic ACP routing failure")
-    );
-    assert_eq!(*runtime.turn_calls.lock().expect("turn calls lock"), 0);
-    assert_eq!(
-        shared.lock().expect("ACP shared state").turn_calls,
-        1,
-        "ACP backend should have received the routed turn"
-    );
-    let persisted = runtime.persisted.lock().expect("persisted lock").clone();
-    assert_eq!(persisted.len(), 2);
-    assert_eq!(persisted[0].0, "feishu:oc_123");
-    assert_eq!(
-        persisted[1].2,
-        format_provider_error_reply("synthetic ACP routing failure")
-    );
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_reuses_shared_acp_session_between_turns() {
-    let (backend_id, shared) = register_routed_acp_backend("reuse", false);
-    let runtime = FakeRuntime::new(Vec::new(), Ok("provider-should-not-run".to_owned()));
-    let coordinator = ConversationTurnCoordinator::new();
-    let mut config = test_config();
-    config.acp.enabled = true;
-    config.acp.backend = Some(backend_id.to_owned());
-    config.memory.sqlite_path = unique_acp_sqlite_path("reuse");
-
-    let first = coordinator
-        .handle_turn_with_runtime_and_address_and_acp_options(
-            &config,
-            &ConversationSessionAddress::from_session_id("telegram:4242"),
-            "first",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            &AcpConversationTurnOptions {
-                routing_intent: AcpRoutingIntent::Explicit,
-                ..AcpConversationTurnOptions::default()
-            },
-            None,
-        )
-        .await
-        .expect("first ACP-routed turn");
-    let second = coordinator
-        .handle_turn_with_runtime_and_address_and_acp_options(
-            &config,
-            &ConversationSessionAddress::from_session_id("telegram:4242"),
-            "second",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            &AcpConversationTurnOptions {
-                routing_intent: AcpRoutingIntent::Explicit,
-                ..AcpConversationTurnOptions::default()
-            },
-            None,
-        )
-        .await
-        .expect("second ACP-routed turn");
-
-    assert_eq!(first, "acp: first");
-    assert_eq!(second, "acp: second");
-    let state = shared.lock().expect("ACP shared state");
-    assert_eq!(
-        state.ensure_calls, 1,
-        "ACP session should be reused through the shared control-plane manager"
-    );
-    assert_eq!(state.turn_calls, 2);
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_persists_acp_runtime_events_when_enabled() {
-    let (backend_id, _shared) = register_routed_acp_backend_with_events(
-        "runtime-events",
-        false,
-        vec![
-            json!({
-                "type": "text",
-                "content": "partial hello"
-            }),
-            json!({
-                "type": "done",
-                "stopReason": "completed"
-            }),
-        ],
-    );
-    let runtime = FakeRuntime::new(Vec::new(), Ok("provider-should-not-run".to_owned()));
-    let coordinator = ConversationTurnCoordinator::new();
-    let mut config = test_config();
-    config.acp.enabled = true;
-    config.acp.backend = Some(backend_id.to_owned());
-    config.acp.emit_runtime_events = true;
-    config.memory.sqlite_path = unique_acp_sqlite_path("runtime-events");
-
-    let reply = coordinator
-        .handle_turn_with_runtime_and_address_and_acp_options(
-            &config,
-            &ConversationSessionAddress::from_session_id("telegram:777"),
-            "hello runtime events",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            &AcpConversationTurnOptions {
-                routing_intent: AcpRoutingIntent::Explicit,
-                ..AcpConversationTurnOptions::default()
-            },
-            None,
-        )
-        .await
-        .expect("ACP-routed turn with runtime events should succeed");
-
-    assert_eq!(reply, "acp: hello runtime events");
-    let persisted = runtime.persisted.lock().expect("persisted lock").clone();
-    let event_records = persisted
-        .iter()
-        .filter_map(|(_, role, content)| {
-            if role != "assistant" {
-                return None;
-            }
-            let parsed = serde_json::from_str::<Value>(content).ok()?;
-            if parsed.get("type")?.as_str()? != "conversation_event" {
-                return None;
-            }
-            parsed.get("event")?.as_str().map(ToOwned::to_owned)
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        event_records.iter().any(|event| event == "acp_turn_event"),
-        "expected persisted ACP turn event records, got: {event_records:?}"
-    );
-    assert!(
-        event_records.iter().any(|event| event == "acp_turn_final"),
-        "expected persisted ACP turn final record, got: {event_records:?}"
-    );
-    let agent_ids = persisted
-        .iter()
-        .filter_map(|(_, role, content)| {
-            if role != "assistant" {
-                return None;
-            }
-            let parsed = serde_json::from_str::<Value>(content).ok()?;
-            if parsed.get("type")?.as_str()? != "conversation_event" {
-                return None;
-            }
-            parsed
-                .get("payload")?
-                .get("agent_id")?
-                .as_str()
-                .map(ToOwned::to_owned)
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        agent_ids.iter().any(|agent| agent == "codex"),
-        "expected persisted ACP runtime records to expose explicit agent_id, got: {agent_ids:?}"
-    );
-    let routing_intents = persisted
-        .iter()
-        .filter_map(|(_, role, content)| {
-            if role != "assistant" {
-                return None;
-            }
-            let parsed = serde_json::from_str::<Value>(content).ok()?;
-            if parsed.get("type")?.as_str()? != "conversation_event" {
-                return None;
-            }
-            parsed
-                .get("payload")?
-                .get("routing_intent")?
-                .as_str()
-                .map(ToOwned::to_owned)
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        routing_intents.iter().any(|intent| intent == "explicit"),
-        "expected persisted ACP runtime records to keep routing_intent, got: {routing_intents:?}"
-    );
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_streams_acp_runtime_events_to_external_sink_without_persisting() {
-    let (backend_id, _shared) = register_routed_acp_backend_with_events(
-        "external-runtime-events",
-        false,
-        vec![
-            json!({
-                "type": "text",
-                "content": "partial hello"
-            }),
-            json!({
-                "type": "done",
-                "stopReason": "completed"
-            }),
-        ],
-    );
-    let runtime = FakeRuntime::new(Vec::new(), Ok("provider-should-not-run".to_owned()));
-    let coordinator = ConversationTurnCoordinator::new();
-    let sink = RecordingAcpEventSink::default();
-    let mut config = test_config();
-    config.acp.enabled = true;
-    config.acp.backend = Some(backend_id.to_owned());
-    config.acp.emit_runtime_events = false;
-    config.memory.sqlite_path = unique_acp_sqlite_path("external-runtime-events");
-
-    let acp_options = AcpConversationTurnOptions::from_event_sink(Some(&sink));
-    let reply = coordinator
-        .handle_turn_with_runtime_and_address_and_acp_options(
-            &config,
-            &ConversationSessionAddress::from_session_id("telegram:778"),
-            "hello external runtime events",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            &acp_options,
-            None,
-        )
-        .await
-        .expect("ACP-routed turn with external event sink should succeed");
-
-    assert_eq!(reply, "acp: hello external runtime events");
-    assert_eq!(
-        sink.snapshot(),
-        vec![
-            json!({
-                "type": "text",
-                "content": "partial hello"
-            }),
-            json!({
-                "type": "done",
-                "stopReason": "completed"
-            }),
-        ]
-    );
-    let persisted = runtime.persisted.lock().expect("persisted lock").clone();
-    assert_eq!(
-        persisted.len(),
-        2,
-        "only user/assistant turns should persist"
-    );
-    assert!(persisted.iter().all(|(_, role, content)| {
-        *role != "assistant"
-            || serde_json::from_str::<Value>(content)
-                .ok()
-                .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
-                .as_deref()
-                != Some("conversation_event")
-    }));
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_streams_and_persists_acp_runtime_events_when_both_enabled() {
-    let (backend_id, _shared) = register_routed_acp_backend_with_events(
-        "external-and-persisted-runtime-events",
-        false,
-        vec![
-            json!({
-                "type": "text",
-                "content": "partial hello"
-            }),
-            json!({
-                "type": "done",
-                "stopReason": "completed"
-            }),
-        ],
-    );
-    let runtime = FakeRuntime::new(Vec::new(), Ok("provider-should-not-run".to_owned()));
-    let coordinator = ConversationTurnCoordinator::new();
-    let sink = RecordingAcpEventSink::default();
-    let mut config = test_config();
-    config.acp.enabled = true;
-    config.acp.backend = Some(backend_id.to_owned());
-    config.acp.emit_runtime_events = true;
-    config.memory.sqlite_path = unique_acp_sqlite_path("external-and-persisted-runtime-events");
-
-    let acp_options = AcpConversationTurnOptions::from_event_sink(Some(&sink));
-    let reply = coordinator
-        .handle_turn_with_runtime_and_address_and_acp_options(
-            &config,
-            &ConversationSessionAddress::from_session_id("telegram:779"),
-            "hello external and persisted runtime events",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            &acp_options,
-            None,
-        )
-        .await
-        .expect("ACP-routed turn with external sink and persistence should succeed");
-
-    assert_eq!(reply, "acp: hello external and persisted runtime events");
-    assert_eq!(
-        sink.snapshot(),
-        vec![
-            json!({
-                "type": "text",
-                "content": "partial hello"
-            }),
-            json!({
-                "type": "done",
-                "stopReason": "completed"
-            }),
-        ]
-    );
-    let persisted = runtime.persisted.lock().expect("persisted lock").clone();
-    let event_records = persisted
-        .iter()
-        .filter_map(|(_, role, content)| {
-            if role != "assistant" {
-                return None;
-            }
-            let parsed = serde_json::from_str::<Value>(content).ok()?;
-            if parsed.get("type")?.as_str()? != "conversation_event" {
-                return None;
-            }
-            parsed.get("event")?.as_str().map(ToOwned::to_owned)
-        })
-        .collect::<Vec<_>>();
-    assert!(event_records.iter().any(|event| event == "acp_turn_event"));
-    assert!(event_records.iter().any(|event| event == "acp_turn_final"));
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_skips_compaction_when_disabled() {
-    let runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("assistant-reply".to_owned()),
-    );
-    let mut config = test_config();
-    config.conversation.compact_enabled = false;
-
-    let coordinator = ConversationTurnCoordinator::new();
-    let reply = coordinator
-        .handle_turn_with_runtime(
-            &config,
-            "session-no-compact",
-            "hello",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            None,
-        )
-        .await
-        .expect("handle turn success");
-
-    assert_eq!(reply, "assistant-reply");
-    assert!(
-        runtime
-            .compact_calls
-            .lock()
-            .expect("compact lock")
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_skips_compaction_below_min_messages() {
-    let runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("assistant-reply".to_owned()),
-    );
-    let mut config = test_config();
-    config.conversation.compact_min_messages = Some(10);
-
-    let coordinator = ConversationTurnCoordinator::new();
-    let reply = coordinator
-        .handle_turn_with_runtime(
-            &config,
-            "session-no-compact-threshold",
-            "hello",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            None,
-        )
-        .await
-        .expect("handle turn success");
-
-    assert_eq!(reply, "assistant-reply");
-    assert!(
-        runtime
-            .compact_calls
-            .lock()
-            .expect("compact lock")
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_skips_compaction_below_token_threshold() {
-    let runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("assistant-reply".to_owned()),
-    );
-    let mut config = test_config();
-    config.conversation.compact_min_messages = None;
-    config.conversation.compact_trigger_estimated_tokens = Some(100_000);
-
-    let coordinator = ConversationTurnCoordinator::new();
-    let reply = coordinator
-        .handle_turn_with_runtime(
-            &config,
-            "session-no-compact-token-threshold",
-            "hello",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            None,
-        )
-        .await
-        .expect("handle turn success");
-
-    assert_eq!(reply, "assistant-reply");
-    assert!(
-        runtime
-            .compact_calls
-            .lock()
-            .expect("compact lock")
-            .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_compacts_when_token_threshold_reached() {
-    let runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("assistant-reply".to_owned()),
-    );
-    let mut config = test_config();
-    config.conversation.compact_min_messages = Some(999);
-    config.conversation.compact_trigger_estimated_tokens = Some(1);
-
-    let coordinator = ConversationTurnCoordinator::new();
-    let reply = coordinator
-        .handle_turn_with_runtime(
-            &config,
-            "session-compact-token-threshold",
-            "hello",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            None,
-        )
-        .await
-        .expect("handle turn success");
-
-    assert_eq!(reply, "assistant-reply");
-    let compact = runtime.compact_calls.lock().expect("compact lock").clone();
-    assert_eq!(compact.len(), 1);
-    assert_eq!(compact[0].0, "session-compact-token-threshold");
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_compaction_error_is_ignored_when_fail_open() {
-    let mut runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("assistant-reply".to_owned()),
-    );
-    runtime.compact_result = Err("compact failure".to_owned());
-    let mut config = test_config();
-    config.conversation.compact_fail_open = true;
-
-    let coordinator = ConversationTurnCoordinator::new();
-    let reply = coordinator
-        .handle_turn_with_runtime(
-            &config,
-            "session-compact-fail-open",
-            "hello",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            None,
-        )
-        .await
-        .expect("fail-open mode should keep turn successful");
-
-    assert_eq!(reply, "assistant-reply");
-    let compact = runtime.compact_calls.lock().expect("compact lock").clone();
-    assert_eq!(compact.len(), 1);
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_compaction_error_propagates_when_fail_closed() {
-    let mut runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("assistant-reply".to_owned()),
-    );
-    runtime.compact_result = Err("compact failure".to_owned());
-    let mut config = test_config();
-    config.conversation.compact_fail_open = false;
-
-    let coordinator = ConversationTurnCoordinator::new();
-    let error = coordinator
-        .handle_turn_with_runtime(
-            &config,
-            "session-compact-fail-closed",
-            "hello",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            None,
-        )
-        .await
-        .expect_err("fail-closed mode should propagate compaction error");
-
-    assert!(
-        error.contains("compact failure"),
-        "unexpected error: {error}"
-    );
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_persists_turn_checkpoint_events_for_successful_provider_turn() {
-    let runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("assistant-reply".to_owned()),
-    );
-    let mut config = test_config();
-    config.conversation.compact_enabled = false;
-
-    let coordinator = ConversationTurnCoordinator::new();
-    let reply = coordinator
-        .handle_turn_with_runtime(
-            &config,
-            "session-turn-checkpoint-success",
-            "hello",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            None,
-        )
-        .await
-        .expect("success path should persist checkpoint events");
-
-    assert_eq!(reply, "assistant-reply");
-    let persisted = runtime.persisted.lock().expect("persisted lock").clone();
-    let payloads = persisted_conversation_event_payloads_by_name(&persisted, "turn_checkpoint");
-    assert_eq!(payloads.len(), 2, "expected two checkpoint events");
-
-    assert_eq!(payloads[0]["schema_version"], 1);
-    assert_eq!(payloads[0]["stage"], "post_persist");
-    assert_eq!(payloads[0]["checkpoint"]["request"]["kind"], "continue");
-    assert_eq!(
-        payloads[0]["checkpoint"]["identity"],
-        test_turn_checkpoint_identity("hello", "assistant-reply")
-    );
-    assert_eq!(
-        payloads[0]["checkpoint"]["preparation"]["context_fingerprint_sha256"],
-        test_turn_preparation_context_fingerprint(&[
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "hello"}),
-        ])
-    );
-    assert_eq!(payloads[0]["checkpoint"]["lane"]["lane"], "fast");
-    assert_eq!(
-        payloads[0]["checkpoint"]["lane"]["result_kind"],
-        "final_text"
-    );
-    assert_eq!(payloads[0]["checkpoint"]["reply"]["decision"], "direct");
-    assert_eq!(
-        payloads[0]["checkpoint"]["finalization"]["persistence_mode"],
-        "success"
-    );
-    assert_eq!(
-        payloads[0]["finalization_progress"]["after_turn"],
-        "pending"
-    );
-    assert_eq!(
-        payloads[0]["finalization_progress"]["compaction"],
-        "pending"
-    );
-
-    assert_eq!(payloads[1]["schema_version"], 1);
-    assert_eq!(payloads[1]["stage"], "finalized");
-    assert_eq!(
-        payloads[1]["finalization_progress"]["after_turn"],
-        "completed"
-    );
-    assert_eq!(
-        payloads[1]["finalization_progress"]["compaction"],
-        "skipped"
-    );
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_persists_turn_checkpoint_events_for_inline_provider_error() {
-    let runtime = FakeRuntime::new(vec![], Err("timeout".to_owned()));
-    let mut config = test_config();
-    config.conversation.compact_enabled = false;
-
-    let coordinator = ConversationTurnCoordinator::new();
-    let reply = coordinator
-        .handle_turn_with_runtime(
-            &config,
-            "session-turn-checkpoint-inline-error",
-            "hello",
-            ProviderErrorMode::InlineMessage,
-            &runtime,
-            None,
-        )
-        .await
-        .expect("inline provider error should persist checkpoint events");
-
-    assert_eq!(reply, "[provider_error] timeout");
-    let persisted = runtime.persisted.lock().expect("persisted lock").clone();
-    let payloads = persisted_conversation_event_payloads_by_name(&persisted, "turn_checkpoint");
-    assert_eq!(payloads.len(), 2, "expected two checkpoint events");
-
-    assert_eq!(payloads[0]["stage"], "post_persist");
-    assert_eq!(
-        payloads[0]["checkpoint"]["request"]["kind"],
-        "finalize_inline_provider_error"
-    );
-    assert_eq!(
-        payloads[0]["checkpoint"]["identity"],
-        test_turn_checkpoint_identity("hello", "[provider_error] timeout")
-    );
-    assert!(payloads[0]["checkpoint"]["lane"].is_null());
-    assert!(payloads[0]["checkpoint"]["reply"].is_null());
-    assert_eq!(
-        payloads[0]["checkpoint"]["finalization"]["persistence_mode"],
-        "inline_provider_error"
-    );
-
-    assert_eq!(payloads[1]["stage"], "finalized");
-    assert_eq!(
-        payloads[1]["finalization_progress"]["after_turn"],
-        "completed"
-    );
-    assert_eq!(
-        payloads[1]["finalization_progress"]["compaction"],
-        "skipped"
-    );
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_persists_turn_checkpoint_event_for_propagated_provider_error() {
-    let runtime = FakeRuntime::new(vec![], Err("timeout".to_owned()));
-    let mut config = test_config();
-    config.conversation.compact_enabled = false;
-
-    let coordinator = ConversationTurnCoordinator::new();
-    let error = coordinator
-        .handle_turn_with_runtime(
-            &config,
-            "session-turn-checkpoint-propagated-error",
-            "hello",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            None,
-        )
-        .await
-        .expect_err("propagated provider error should still persist checkpoint event");
-
-    assert_eq!(error, "timeout");
-    let persisted = runtime.persisted.lock().expect("persisted lock").clone();
-    let payloads = persisted_conversation_event_payloads_by_name(&persisted, "turn_checkpoint");
-    assert_eq!(payloads.len(), 1, "expected one finalized checkpoint event");
-
-    assert_eq!(payloads[0]["stage"], "finalized");
-    assert_eq!(payloads[0]["checkpoint"]["request"]["kind"], "return_error");
-    assert!(payloads[0]["checkpoint"]["identity"].is_null());
-    assert!(payloads[0]["checkpoint"]["lane"].is_null());
-    assert!(payloads[0]["checkpoint"]["reply"].is_null());
-    assert_eq!(
-        payloads[0]["checkpoint"]["finalization"]["kind"],
-        "return_error"
-    );
-    assert_eq!(
-        payloads[0]["finalization_progress"]["after_turn"],
-        "skipped"
-    );
-    assert_eq!(
-        payloads[0]["finalization_progress"]["compaction"],
-        "skipped"
-    );
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_persists_failed_turn_checkpoint_when_compaction_fails_closed() {
-    let mut runtime = FakeRuntime::new(
-        vec![json!({"role": "system", "content": "sys"})],
-        Ok("assistant-reply".to_owned()),
-    );
-    runtime.compact_result = Err("compact failure".to_owned());
-    let mut config = test_config();
-    config.conversation.compact_fail_open = false;
-    config.conversation.compact_min_messages = Some(1);
-    config.conversation.compact_trigger_estimated_tokens = Some(1);
-
-    let coordinator = ConversationTurnCoordinator::new();
-    let error = coordinator
-        .handle_turn_with_runtime(
-            &config,
-            "session-turn-checkpoint-compaction-failure",
-            "hello",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            None,
-        )
-        .await
-        .expect_err("compaction failure should still persist failed checkpoint event");
-
-    assert!(
-        error.contains("compact failure"),
-        "unexpected error: {error}"
-    );
-    let persisted = runtime.persisted.lock().expect("persisted lock").clone();
-    let payloads = persisted_conversation_event_payloads_by_name(&persisted, "turn_checkpoint");
-    assert_eq!(
-        payloads.len(),
-        2,
-        "expected pre-failure and failure checkpoints"
-    );
-
-    assert_eq!(payloads[0]["stage"], "post_persist");
-    assert_eq!(payloads[1]["stage"], "finalization_failed");
-    assert_eq!(
-        payloads[1]["finalization_progress"]["after_turn"],
-        "completed"
-    );
-    assert_eq!(payloads[1]["finalization_progress"]["compaction"], "failed");
-    assert_eq!(payloads[1]["failure"]["step"], "compaction");
-    assert_eq!(payloads[1]["failure"]["error"], "compact failure");
-}
-
-#[tokio::test]
-async fn handle_turn_with_runtime_propagates_error_without_persisting_reply_turns() {
+async fn handle_turn_with_runtime_propagates_error_without_persisting() {
     let runtime = FakeRuntime::new(vec![], Err("timeout".to_owned()));
     let coordinator = ConversationTurnCoordinator::new();
     let error = coordinator
@@ -2608,40 +665,7 @@ async fn handle_turn_with_runtime_propagates_error_without_persisting_reply_turn
         .expect_err("propagate mode should return error");
 
     assert!(error.contains("timeout"));
-    assert_eq!(
-        runtime
-            .bootstrap_calls
-            .lock()
-            .expect("bootstrap lock")
-            .as_slice(),
-        ["session-2"]
-    );
-    let persisted = runtime.persisted.lock().expect("persisted lock").clone();
-    let payloads = persisted_conversation_event_payloads_by_name(&persisted, "turn_checkpoint");
-    assert_eq!(payloads.len(), 1);
-    assert_eq!(payloads[0]["stage"], "finalized");
-    assert_eq!(payloads[0]["checkpoint"]["request"]["kind"], "return_error");
-    assert!(
-        runtime
-            .ingested_messages
-            .lock()
-            .expect("ingest lock")
-            .is_empty()
-    );
-    assert!(
-        runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .is_empty()
-    );
-    assert!(
-        runtime
-            .compact_calls
-            .lock()
-            .expect("compact lock")
-            .is_empty()
-    );
+    assert!(runtime.persisted.lock().expect("persisted lock").is_empty());
 }
 
 #[tokio::test]
@@ -2661,20 +685,11 @@ async fn handle_turn_with_runtime_inline_mode_returns_synthetic_reply_and_persis
         .expect("inline mode should return synthetic reply");
 
     assert_eq!(output, "[provider_error] timeout");
-    assert_eq!(
-        runtime
-            .bootstrap_calls
-            .lock()
-            .expect("bootstrap lock")
-            .as_slice(),
-        ["session-3"]
-    );
 
-    let persisted = runtime.persisted.lock().expect("persisted lock").clone();
-    let visible_turns = persisted_visible_turns(&persisted);
-    assert_eq!(visible_turns.len(), 2);
+    let persisted = runtime.persisted.lock().expect("persisted lock");
+    assert_eq!(persisted.len(), 2);
     assert_eq!(
-        visible_turns[0],
+        persisted[0],
         (
             "session-3".to_owned(),
             "user".to_owned(),
@@ -2682,40 +697,13 @@ async fn handle_turn_with_runtime_inline_mode_returns_synthetic_reply_and_persis
         )
     );
     assert_eq!(
-        visible_turns[1],
+        persisted[1],
         (
             "session-3".to_owned(),
             "assistant".to_owned(),
             "[provider_error] timeout".to_owned(),
         )
     );
-
-    let ingested = runtime
-        .ingested_messages
-        .lock()
-        .expect("ingest lock")
-        .clone();
-    assert_eq!(ingested.len(), 2);
-    assert_eq!(ingested[0].1["role"], "user");
-    assert_eq!(ingested[0].1["content"], "hello");
-    assert_eq!(ingested[1].1["role"], "assistant");
-    assert_eq!(ingested[1].1["content"], "[provider_error] timeout");
-
-    let after_turn = runtime
-        .after_turn_calls
-        .lock()
-        .expect("after-turn lock")
-        .clone();
-    assert_eq!(after_turn.len(), 1);
-    assert_eq!(after_turn[0].0, "session-3");
-    assert_eq!(after_turn[0].1, "hello");
-    assert_eq!(after_turn[0].2, "[provider_error] timeout");
-    assert_eq!(after_turn[0].3, 2);
-
-    let compact = runtime.compact_calls.lock().expect("compact lock").clone();
-    assert_eq!(compact.len(), 1);
-    assert_eq!(compact[0].0, "session-3");
-    assert_eq!(compact[0].1, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2773,12 +761,11 @@ async fn handle_turn_with_runtime_tool_turn_uses_natural_language_completion_by_
     );
     assert_eq!(*runtime.turn_calls.lock().expect("turn calls lock"), 1);
 
-    let persisted = runtime.persisted.lock().expect("persisted lock").clone();
-    let visible_turns = persisted_visible_turns(&persisted);
-    assert_eq!(visible_turns.len(), 2);
-    assert_eq!(visible_turns[0].1, "user");
-    assert_eq!(visible_turns[1].1, "assistant");
-    assert_eq!(visible_turns[1].2, reply);
+    let persisted = runtime.persisted.lock().expect("persisted lock");
+    assert_eq!(persisted.len(), 2);
+    assert_eq!(persisted[0].1, "user");
+    assert_eq!(persisted[1].1, "assistant");
+    assert_eq!(persisted[1].2, reply);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3263,10 +1250,7 @@ async fn handle_turn_with_runtime_safe_lane_plan_skips_runtime_events_when_disab
                 return None;
             }
             let parsed = serde_json::from_str::<Value>(content).ok()?;
-            if parsed.get("type")?.as_str()? != "conversation_event" {
-                return None;
-            }
-            (parsed.get("event")?.as_str()? != "turn_checkpoint").then_some(())
+            (parsed.get("type")?.as_str()? == "conversation_event").then_some(())
         })
         .count();
     assert_eq!(event_count, 0, "unexpected runtime events: {persisted:?}");
@@ -3315,7 +1299,6 @@ async fn handle_turn_with_runtime_safe_lane_plan_emits_kernel_runtime_audit_even
         .expect("safe lane plan should produce a reply");
 
     let events = harness.audit.snapshot();
-    #[allow(clippy::wildcard_enum_match_arm)]
     let runtime_ops = events
         .iter()
         .filter_map(|event| match &event.kind {
@@ -4013,7 +1996,7 @@ async fn handle_turn_with_runtime_safe_lane_session_governor_forces_no_replan() 
             &self,
             request: MemoryCoreRequest,
         ) -> Result<MemoryCoreOutcome, MemoryPlaneError> {
-            if request.operation == MEMORY_OP_WINDOW {
+            if request.operation == "window" {
                 return Ok(MemoryCoreOutcome {
                     status: "ok".to_owned(),
                     payload: json!({
@@ -4261,7 +2244,7 @@ async fn handle_turn_with_runtime_safe_lane_session_governor_requests_extended_h
                 .lock()
                 .expect("memory invocations lock")
                 .push(request.clone());
-            if request.operation == MEMORY_OP_WINDOW {
+            if request.operation == "window" {
                 return Ok(MemoryCoreOutcome {
                     status: "ok".to_owned(),
                     payload: json!({
@@ -4358,7 +2341,7 @@ async fn handle_turn_with_runtime_safe_lane_session_governor_requests_extended_h
         .clone();
     let window_request = captured
         .iter()
-        .find(|request| request.operation == MEMORY_OP_WINDOW)
+        .find(|request| request.operation == "window")
         .expect("window request should be issued");
     assert_eq!(
         window_request.payload["session_id"],
@@ -4366,199 +2349,6 @@ async fn handle_turn_with_runtime_safe_lane_session_governor_requests_extended_h
     );
     assert_eq!(window_request.payload["limit"], 200);
     assert_eq!(window_request.payload["allow_extended_limit"], true);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn handle_turn_with_runtime_safe_lane_session_governor_falls_back_to_configured_sqlite_history_when_kernel_window_is_non_ok()
- {
-    use loongclaw_contracts::{ToolCoreOutcome, ToolCoreRequest, ToolPlaneError};
-    use loongclaw_kernel::{CoreMemoryAdapter, CoreToolAdapter};
-
-    struct FlakyAlwaysRetryableAdapter {
-        calls: Arc<Mutex<usize>>,
-    }
-
-    #[async_trait]
-    impl CoreToolAdapter for FlakyAlwaysRetryableAdapter {
-        fn name(&self) -> &str {
-            "flaky-governor-fallback-tools"
-        }
-
-        async fn execute_core_tool(
-            &self,
-            _request: ToolCoreRequest,
-        ) -> Result<ToolCoreOutcome, ToolPlaneError> {
-            {
-                let mut calls = self.calls.lock().expect("flaky calls lock");
-                *calls = calls.saturating_add(1);
-            }
-            Err(ToolPlaneError::Execution(
-                "transient tool failure".to_owned(),
-            ))
-        }
-    }
-
-    struct NonOkWindowMemoryAdapter;
-
-    #[async_trait]
-    impl CoreMemoryAdapter for NonOkWindowMemoryAdapter {
-        fn name(&self) -> &str {
-            "non-ok-governor-memory"
-        }
-
-        async fn execute_core_memory(
-            &self,
-            request: MemoryCoreRequest,
-        ) -> Result<MemoryCoreOutcome, MemoryPlaneError> {
-            if request.operation == MEMORY_OP_WINDOW {
-                return Ok(MemoryCoreOutcome {
-                    status: "error".to_owned(),
-                    payload: json!({
-                        "reason": "kernel memory window unavailable"
-                    }),
-                });
-            }
-            Ok(MemoryCoreOutcome {
-                status: "ok".to_owned(),
-                payload: json!({}),
-            })
-        }
-    }
-
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-safe-lane-governor", "sqlite-fallback")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let call_counter = Arc::new(Mutex::new(0usize));
-    let audit = Arc::new(InMemoryAuditSink::default());
-    let clock = Arc::new(FixedClock::new(1_700_000_000));
-    let mut kernel = LoongClawKernel::with_runtime(StaticPolicyEngine::default(), clock, audit);
-
-    let pack = VerticalPackManifest {
-        pack_id: "test-pack".to_owned(),
-        domain: "testing".to_owned(),
-        version: "0.1.0".to_owned(),
-        default_route: ExecutionRoute {
-            harness_kind: HarnessKind::EmbeddedPi,
-            adapter: None,
-        },
-        allowed_connectors: BTreeSet::new(),
-        granted_capabilities: BTreeSet::from([Capability::InvokeTool, Capability::MemoryRead]),
-        metadata: BTreeMap::new(),
-    };
-    kernel.register_pack(pack).expect("register pack");
-    kernel.register_core_memory_adapter(NonOkWindowMemoryAdapter);
-    kernel
-        .set_default_core_memory_adapter("non-ok-governor-memory")
-        .expect("set default core memory adapter");
-    kernel.register_core_tool_adapter(FlakyAlwaysRetryableAdapter {
-        calls: call_counter.clone(),
-    });
-    kernel
-        .set_default_core_tool_adapter("flaky-governor-fallback-tools")
-        .expect("set default core tool adapter");
-
-    let token = kernel
-        .issue_token("test-pack", "test-agent", 3600)
-        .expect("issue token");
-    let ctx = KernelContext {
-        kernel: Arc::new(kernel),
-        token,
-    };
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.conversation.safe_lane_plan_execution_enabled = true;
-    config.conversation.safe_lane_node_max_attempts = 1;
-    config.conversation.safe_lane_replan_max_rounds = 3;
-    config.conversation.safe_lane_replan_max_node_attempts = 4;
-    config.conversation.safe_lane_session_governor_enabled = true;
-    config
-        .conversation
-        .safe_lane_session_governor_failed_final_status_threshold = 1;
-    config
-        .conversation
-        .safe_lane_session_governor_backpressure_failure_threshold = 9;
-    config
-        .conversation
-        .safe_lane_session_governor_force_no_replan = true;
-    config
-        .conversation
-        .safe_lane_session_governor_force_node_max_attempts = 1;
-
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-    crate::memory::append_turn_direct(
-        "session-safe-governor-fallback",
-        "assistant",
-        r#"{"type":"conversation_event","event":"final_status","payload":{"status":"failed","failure_code":"safe_lane_plan_node_retryable_error","route_decision":"terminal"}} "#.trim(),
-        &mem_config,
-    )
-    .expect("persist governor history into configured sqlite db");
-
-    let runtime = FakeRuntime::with_turn_and_completion(
-        vec![],
-        Ok(ProviderTurn {
-            assistant_text: "Running checks.".to_owned(),
-            tool_intents: vec![ToolIntent {
-                tool_name: "file.read".to_owned(),
-                args_json: json!({"path": "note.md"}),
-                source: "provider_tool_call".to_owned(),
-                session_id: "session-safe-governor-fallback".to_owned(),
-                turn_id: "turn-safe-governor-fallback".to_owned(),
-                tool_call_id: "call-safe-governor-fallback-1".to_owned(),
-            }],
-            raw_meta: Value::Null,
-        }),
-        Ok("unused".to_owned()),
-    );
-
-    let coordinator = ConversationTurnCoordinator::new();
-    let _reply = coordinator
-        .handle_turn_with_runtime(
-            &config,
-            "session-safe-governor-fallback",
-            "deploy to production with secret token and show raw json tool output",
-            ProviderErrorMode::Propagate,
-            &runtime,
-            Some(&ctx),
-        )
-        .await
-        .expect("safe lane should use sqlite governor fallback history");
-
-    let calls = *call_counter.lock().expect("call counter lock");
-    assert_eq!(
-        calls, 1,
-        "governor should suppress replans when configured sqlite history shows chronic failure"
-    );
-
-    let persisted = runtime.persisted.lock().expect("persisted lock");
-    let lane_selected_payload = persisted
-        .iter()
-        .filter_map(|(_, role, content)| {
-            if role != "assistant" {
-                return None;
-            }
-            let parsed = serde_json::from_str::<Value>(content).ok()?;
-            if parsed.get("type")?.as_str()? != "conversation_event" {
-                return None;
-            }
-            if parsed.get("event")?.as_str()? != "lane_selected" {
-                return None;
-            }
-            parsed.get("payload").cloned()
-        })
-        .next_back()
-        .expect("lane_selected payload");
-    assert_eq!(lane_selected_payload["session_governor"]["engaged"], true);
-    assert_eq!(
-        lane_selected_payload["session_governor"]["failed_threshold_triggered"],
-        true
-    );
-
-    let _ = std::fs::remove_file(&db_path);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4765,10 +2555,9 @@ async fn handle_turn_with_runtime_tool_denial_returns_inline_reply_even_in_propa
         "tool-denied fallback should run a completion pass for language-aware output"
     );
 
-    let persisted = runtime.persisted.lock().expect("persisted lock").clone();
-    let visible_turns = persisted_visible_turns(&persisted);
-    assert_eq!(visible_turns.len(), 2);
-    assert_eq!(visible_turns[1].2, reply);
+    let persisted = runtime.persisted.lock().expect("persisted lock");
+    assert_eq!(persisted.len(), 2);
+    assert_eq!(persisted[1].2, reply);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4825,10 +2614,9 @@ async fn handle_turn_with_runtime_tool_error_returns_natural_language_fallback()
         "tool-error fallback should run a completion pass for language-aware output"
     );
 
-    let persisted = runtime.persisted.lock().expect("persisted lock").clone();
-    let visible_turns = persisted_visible_turns(&persisted);
-    assert_eq!(visible_turns.len(), 2);
-    assert_eq!(visible_turns[1].2, reply);
+    let persisted = runtime.persisted.lock().expect("persisted lock");
+    assert_eq!(persisted.len(), 2);
+    assert_eq!(persisted[1].2, reply);
 }
 
 #[tokio::test]
@@ -4921,7 +2709,6 @@ fn turn_engine_no_tool_intents_returns_final_text() {
         raw_meta: serde_json::Value::Null,
     };
     let result = engine.evaluate_turn(&turn);
-    #[allow(clippy::wildcard_enum_match_arm)]
     match result {
         TurnResult::FinalText(text) => assert_eq!(text, "Hello!"),
         other => panic!("expected FinalText, got {:?}", other),
@@ -4955,7 +2742,6 @@ fn provider_tool_aliases_flow_through_parse_and_turn_validation() {
 
     let engine = TurnEngine::new(1);
     let result = engine.evaluate_turn(&turn);
-    #[allow(clippy::wildcard_enum_match_arm)]
     match result {
         TurnResult::NeedsApproval(reason) => {
             assert!(
@@ -4984,7 +2770,6 @@ fn turn_engine_unknown_tool_returns_tool_denied() {
         raw_meta: serde_json::Value::Null,
     };
     let result = engine.evaluate_turn(&turn);
-    #[allow(clippy::wildcard_enum_match_arm)]
     match result {
         TurnResult::ToolDenied(reason) => {
             assert!(reason.contains("tool_not_found"), "reason: {reason}")
@@ -5013,7 +2798,6 @@ fn turn_engine_unknown_tool_exposes_structured_policy_denial() {
     };
 
     let result = engine.evaluate_turn(&turn);
-    #[allow(clippy::wildcard_enum_match_arm)]
     match result {
         TurnResult::ToolDenied(failure) => {
             assert_eq!(failure.kind, TurnFailureKind::PolicyDenied);
@@ -5046,7 +2830,6 @@ fn turn_engine_exceeding_max_steps_returns_denied() {
         raw_meta: serde_json::Value::Null,
     };
     let result = engine.evaluate_turn(&turn);
-    #[allow(clippy::wildcard_enum_match_arm)]
     match result {
         TurnResult::ToolDenied(reason) => assert!(
             reason.contains("max_tool_steps_exceeded"),
@@ -5074,7 +2857,6 @@ fn turn_engine_known_tool_with_no_kernel_returns_tool_denied() {
     };
     // Without kernel context, known tools should be validated but flagged as needing execution
     let result = engine.evaluate_turn(&turn);
-    #[allow(clippy::wildcard_enum_match_arm)]
     match result {
         TurnResult::NeedsApproval(reason) => {
             assert!(
@@ -5103,7 +2885,6 @@ async fn turn_engine_execute_turn_no_kernel_returns_denied() {
         raw_meta: serde_json::Value::Null,
     };
     let result = engine.execute_turn(&turn, None).await;
-    #[allow(clippy::wildcard_enum_match_arm)]
     match result {
         TurnResult::ToolDenied(reason) => {
             assert!(reason.contains("no_kernel_context"), "reason: {reason}");
@@ -5182,7 +2963,6 @@ async fn turn_engine_tool_execution_error_is_marked_retryable() {
     };
 
     let result = engine.execute_turn(&turn, Some(&ctx)).await;
-    #[allow(clippy::wildcard_enum_match_arm)]
     match result {
         TurnResult::ToolError(failure) => {
             assert_eq!(failure.kind, TurnFailureKind::Retryable);
@@ -5322,7 +3102,6 @@ async fn turn_engine_executes_known_tool_with_kernel() {
     };
 
     let result = engine.execute_turn(&turn, Some(&ctx)).await;
-    #[allow(clippy::wildcard_enum_match_arm)]
     match result {
         TurnResult::FinalText(text) => {
             let line = text.lines().next().expect("tool result line should exist");
@@ -5443,7 +3222,6 @@ async fn turn_engine_truncates_oversized_tool_payload_summary() {
     };
 
     let result = engine.execute_turn(&turn, Some(&ctx)).await;
-    #[allow(clippy::wildcard_enum_match_arm)]
     match result {
         TurnResult::FinalText(text) => {
             let line = text.lines().next().expect("tool result line should exist");
@@ -5476,106 +3254,6 @@ async fn turn_engine_truncates_oversized_tool_payload_summary() {
             );
         }
         other => panic!("expected FinalText, got {:?}", other),
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn turn_engine_keeps_external_skill_invoke_payloads_intact() {
-    use crate::conversation::turn_engine::{ProviderTurn, ToolIntent, TurnEngine, TurnResult};
-    use loongclaw_contracts::{ToolCoreOutcome, ToolCoreRequest, ToolPlaneError};
-    use loongclaw_kernel::CoreToolAdapter;
-
-    struct ExternalSkillInvokeAdapter;
-
-    #[async_trait]
-    impl CoreToolAdapter for ExternalSkillInvokeAdapter {
-        fn name(&self) -> &str {
-            "external-skill-invoke-adapter"
-        }
-
-        async fn execute_core_tool(
-            &self,
-            request: ToolCoreRequest,
-        ) -> Result<ToolCoreOutcome, ToolPlaneError> {
-            Ok(ToolCoreOutcome {
-                status: "ok".to_owned(),
-                payload: json!({
-                    "tool": request.tool_name,
-                    "instructions": "Follow the managed skill instruction. ".repeat(200),
-                    "invocation_summary": "Loaded managed external skill instructions."
-                }),
-            })
-        }
-    }
-
-    let audit = Arc::new(InMemoryAuditSink::default());
-    let clock = Arc::new(FixedClock::new(1_700_000_000));
-    let mut kernel = LoongClawKernel::with_runtime(StaticPolicyEngine::default(), clock, audit);
-
-    let pack = VerticalPackManifest {
-        pack_id: "test-pack".to_owned(),
-        domain: "testing".to_owned(),
-        version: "0.1.0".to_owned(),
-        default_route: ExecutionRoute {
-            harness_kind: HarnessKind::EmbeddedPi,
-            adapter: None,
-        },
-        allowed_connectors: BTreeSet::new(),
-        granted_capabilities: BTreeSet::from([Capability::InvokeTool]),
-        metadata: BTreeMap::new(),
-    };
-    kernel.register_pack(pack).expect("register pack");
-    kernel.register_core_tool_adapter(ExternalSkillInvokeAdapter);
-    kernel
-        .set_default_core_tool_adapter("external-skill-invoke-adapter")
-        .expect("set default");
-
-    let token = kernel
-        .issue_token("test-pack", "test-agent", 3600)
-        .expect("issue token");
-
-    let ctx = KernelContext {
-        kernel: Arc::new(kernel),
-        token,
-    };
-
-    let engine = TurnEngine::new(5);
-    let turn = ProviderTurn {
-        assistant_text: "".to_owned(),
-        tool_intents: vec![ToolIntent {
-            tool_name: "external_skills.invoke".to_owned(),
-            args_json: json!({"skill_id": "demo-skill"}),
-            source: "provider_tool_call".to_owned(),
-            session_id: "s1".to_owned(),
-            turn_id: "t1".to_owned(),
-            tool_call_id: "c-skill".to_owned(),
-        }],
-        raw_meta: serde_json::Value::Null,
-    };
-
-    let result = engine.execute_turn(&turn, Some(&ctx)).await;
-    match result {
-        TurnResult::FinalText(text) => {
-            let line = text.lines().next().expect("tool result line should exist");
-            let payload = line
-                .strip_prefix("[ok] ")
-                .expect("tool result line should keep [ok] prefix");
-            let envelope: Value =
-                serde_json::from_str(payload).expect("tool result envelope should be valid json");
-            assert_eq!(envelope["tool"], "external_skills.invoke");
-            assert_eq!(envelope["payload_truncated"], json!(false));
-            assert!(
-                envelope["payload_summary"]
-                    .as_str()
-                    .expect("payload summary should be text")
-                    .contains("Follow the managed skill instruction."),
-                "payload summary should keep invoke instructions intact: {envelope:?}"
-            );
-        }
-        other @ TurnResult::NeedsApproval(_)
-        | other @ TurnResult::ToolDenied(_)
-        | other @ TurnResult::ToolError(_)
-        | other @ TurnResult::ProviderError(_) => panic!("unexpected result: {other:?}"),
     }
 }
 
@@ -5651,7 +3329,6 @@ async fn turn_engine_execute_turn_denied_without_capability() {
     };
 
     let result = engine.execute_turn(&turn, Some(&ctx)).await;
-    #[allow(clippy::wildcard_enum_match_arm)]
     match result {
         TurnResult::ToolDenied(reason) => {
             assert!(
@@ -5732,22 +3409,6 @@ async fn turn_engine_persists_tool_lifecycle_events() {
 fn build_kernel_context(
     audit: Arc<InMemoryAuditSink>,
 ) -> (KernelContext, Arc<Mutex<Vec<MemoryCoreRequest>>>) {
-    build_kernel_context_with_window_turns(
-        audit,
-        json!([
-            {
-                "role": "assistant",
-                "content": "kernel-memory-window",
-                "ts": 1
-            }
-        ]),
-    )
-}
-
-fn build_kernel_context_with_window_turns(
-    audit: Arc<InMemoryAuditSink>,
-    window_turns: Value,
-) -> (KernelContext, Arc<Mutex<Vec<MemoryCoreRequest>>>) {
     let clock = Arc::new(FixedClock::new(1_700_000_000));
     let mut kernel = LoongClawKernel::with_runtime(StaticPolicyEngine::default(), clock, audit);
 
@@ -5768,7 +3429,6 @@ fn build_kernel_context_with_window_turns(
     let invocations = Arc::new(Mutex::new(Vec::new()));
     let adapter = SharedTestMemoryAdapter {
         invocations: invocations.clone(),
-        window_turns,
     };
     kernel.register_core_memory_adapter(adapter);
     kernel
@@ -5787,52 +3447,8 @@ fn build_kernel_context_with_window_turns(
     (ctx, invocations)
 }
 
-fn build_kernel_context_with_window_turn_sequence(
-    audit: Arc<InMemoryAuditSink>,
-    window_turn_sequence: Vec<Value>,
-) -> (KernelContext, Arc<Mutex<Vec<MemoryCoreRequest>>>) {
-    let clock = Arc::new(FixedClock::new(1_700_000_000));
-    let mut kernel = LoongClawKernel::with_runtime(StaticPolicyEngine::default(), clock, audit);
-
-    let pack = VerticalPackManifest {
-        pack_id: "test-pack".to_owned(),
-        domain: "testing".to_owned(),
-        version: "0.1.0".to_owned(),
-        default_route: ExecutionRoute {
-            harness_kind: HarnessKind::EmbeddedPi,
-            adapter: None,
-        },
-        allowed_connectors: BTreeSet::new(),
-        granted_capabilities: BTreeSet::from([Capability::MemoryWrite, Capability::MemoryRead]),
-        metadata: BTreeMap::new(),
-    };
-    kernel.register_pack(pack).expect("register pack");
-
-    let invocations = Arc::new(Mutex::new(Vec::new()));
-    let adapter = SequencedTestMemoryAdapter {
-        invocations: invocations.clone(),
-        window_turns: Mutex::new(VecDeque::from(window_turn_sequence)),
-    };
-    kernel.register_core_memory_adapter(adapter);
-    kernel
-        .set_default_core_memory_adapter("test-memory-sequenced")
-        .expect("set default memory adapter");
-
-    let token = kernel
-        .issue_token("test-pack", "test-agent", 3600)
-        .expect("issue token");
-
-    let ctx = KernelContext {
-        kernel: Arc::new(kernel),
-        token,
-    };
-
-    (ctx, invocations)
-}
-
 struct SharedTestMemoryAdapter {
     invocations: Arc<Mutex<Vec<MemoryCoreRequest>>>,
-    window_turns: Value,
 }
 
 #[async_trait]
@@ -5847,44 +3463,13 @@ impl CoreMemoryAdapter for SharedTestMemoryAdapter {
     ) -> Result<MemoryCoreOutcome, MemoryPlaneError> {
         let payload = if request.operation == crate::memory::MEMORY_OP_WINDOW {
             json!({
-                "turns": self.window_turns.clone()
-            })
-        } else {
-            json!({})
-        };
-        self.invocations
-            .lock()
-            .expect("invocations lock")
-            .push(request);
-        Ok(MemoryCoreOutcome {
-            status: "ok".to_owned(),
-            payload,
-        })
-    }
-}
-
-struct SequencedTestMemoryAdapter {
-    invocations: Arc<Mutex<Vec<MemoryCoreRequest>>>,
-    window_turns: Mutex<VecDeque<Value>>,
-}
-
-#[async_trait]
-impl CoreMemoryAdapter for SequencedTestMemoryAdapter {
-    fn name(&self) -> &str {
-        "test-memory-sequenced"
-    }
-
-    async fn execute_core_memory(
-        &self,
-        request: MemoryCoreRequest,
-    ) -> Result<MemoryCoreOutcome, MemoryPlaneError> {
-        let payload = if request.operation == crate::memory::MEMORY_OP_WINDOW {
-            let turns = {
-                let mut queued_turns = self.window_turns.lock().expect("window turns lock");
-                queued_turns.pop_front().unwrap_or_else(|| json!([]))
-            };
-            json!({
-                "turns": turns
+                "turns": [
+                    {
+                        "role": "assistant",
+                        "content": "history-from-kernel",
+                        "ts": 1
+                    }
+                ]
             })
         } else {
             json!({})
@@ -5905,7 +3490,7 @@ async fn persist_turn_routes_through_kernel_when_context_provided() {
     let audit = Arc::new(InMemoryAuditSink::default());
     let (ctx, invocations) = build_kernel_context(audit.clone());
 
-    let runtime = DefaultConversationRuntime::default();
+    let runtime = DefaultConversationRuntime;
     runtime
         .persist_turn("session-k1", "user", "kernel-hello", Some(&ctx))
         .await
@@ -5937,10 +3522,11 @@ async fn persist_turn_routes_through_kernel_when_context_provided() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn build_messages_routes_memory_window_through_kernel_when_context_provided() {
+async fn build_messages_routes_window_through_kernel_when_context_provided() {
     let audit = Arc::new(InMemoryAuditSink::default());
     let (ctx, invocations) = build_kernel_context(audit.clone());
-    let runtime = DefaultConversationRuntime::default();
+
+    let runtime = DefaultConversationRuntime;
     let config = test_config();
     let messages = runtime
         .build_messages(&config, "session-k-window", true, Some(&ctx))
@@ -5955,7 +3541,7 @@ async fn build_messages_routes_memory_window_through_kernel_when_context_provide
     assert!(
         messages
             .iter()
-            .any(|message| message["content"] == "kernel-memory-window"),
+            .any(|message| message["content"] == "history-from-kernel"),
         "messages should include history loaded from kernel window payload"
     );
 
@@ -5984,2689 +3570,14 @@ async fn build_messages_routes_memory_window_through_kernel_when_context_provide
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn load_turn_checkpoint_event_summary_prefers_kernel_memory_window_when_context_provided() {
-    let checkpoint_turns = json!([
-        {
-            "role": "assistant",
-            "content": json!({
-                "type": "conversation_event",
-                "event": "turn_checkpoint",
-                "payload": {
-                    "schema_version": 1,
-                    "stage": "post_persist",
-                    "checkpoint": {
-                        "lane": {
-                            "lane": "safe",
-                            "result_kind": "tool_call"
-                        },
-                        "finalization": {
-                            "persistence_mode": "success"
-                        }
-                    },
-                    "finalization_progress": {
-                        "after_turn": "pending",
-                        "compaction": "pending"
-                    },
-                    "failure": null
-                }
-            })
-            .to_string(),
-            "ts": 1
-        },
-        {
-            "role": "assistant",
-            "content": json!({
-                "type": "conversation_event",
-                "event": "turn_checkpoint",
-                "payload": {
-                    "schema_version": 1,
-                    "stage": "finalized",
-                    "checkpoint": {
-                        "lane": {
-                            "lane": "safe",
-                            "result_kind": "tool_call"
-                        },
-                        "finalization": {
-                            "persistence_mode": "success"
-                        }
-                    },
-                    "finalization_progress": {
-                        "after_turn": "completed",
-                        "compaction": "skipped"
-                    },
-                    "failure": null
-                }
-            })
-            .to_string(),
-            "ts": 2
-        }
-    ]);
-    let audit = Arc::new(InMemoryAuditSink::default());
-    let (ctx, invocations) = build_kernel_context_with_window_turns(audit, checkpoint_turns);
-    let config = test_config();
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    let summary = load_turn_checkpoint_event_summary(
-        "session-k-turn-checkpoint",
-        96,
-        Some(&ctx),
-        &mem_config,
-    )
-    .await
-    .expect("load checkpoint summary via kernel");
-
-    assert_eq!(summary.checkpoint_events, 2);
-    assert_eq!(summary.session_state, TurnCheckpointSessionState::Finalized);
-    assert!(summary.checkpoint_durable);
-    assert_eq!(summary.latest_stage, Some(TurnCheckpointStage::Finalized));
-    assert_eq!(
-        summary.latest_after_turn,
-        Some(TurnCheckpointProgressStatus::Completed)
-    );
-    assert_eq!(
-        summary.latest_compaction,
-        Some(TurnCheckpointProgressStatus::Skipped)
-    );
-    assert!(!summary.requires_recovery);
-    assert!(summary.reply_durable);
-
-    let captured = invocations.lock().expect("invocations lock");
-    assert_eq!(captured.len(), 1);
-    assert_eq!(captured[0].operation, crate::memory::MEMORY_OP_WINDOW);
-    assert_eq!(
-        captured[0].payload["session_id"],
-        "session-k-turn-checkpoint"
-    );
-    assert_eq!(captured[0].payload["limit"], json!(96));
-    assert_eq!(captured[0].payload["allow_extended_limit"], json!(true));
-}
-
 #[cfg(not(feature = "memory-sqlite"))]
 #[tokio::test]
 async fn persist_turn_without_memory_sqlite_is_noop_with_kernel_context() {
     let ctx = crate::context::bootstrap_kernel_context("test-agent-no-memory", 60)
         .expect("bootstrap kernel context without memory-sqlite");
-    let runtime = DefaultConversationRuntime::default();
+    let runtime = DefaultConversationRuntime;
     runtime
         .persist_turn("session-k0", "user", "no-memory", Some(&ctx))
         .await
         .expect("persist should be no-op when memory-sqlite is disabled");
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn persisted_turn_checkpoint_events_survive_reload_without_polluting_prompt_history() {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-turn-checkpoint", "reload")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 16;
-
-    let runtime = DefaultConversationRuntime::default();
-    let session_id = "session-turn-checkpoint-reload";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "post_persist",
-                "checkpoint": {
-                    "identity": test_turn_checkpoint_identity("hello", "assistant-reply"),
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success"
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "pending",
-                    "compaction": "pending"
-                },
-                "failure": null
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist post_persist checkpoint");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "finalized",
-                "checkpoint": {
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success"
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "completed",
-                    "compaction": "skipped"
-                },
-                "failure": null
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist finalized checkpoint");
-
-    let messages = runtime
-        .build_messages(&config, session_id, true, None)
-        .await
-        .expect("reload prompt history");
-    assert!(
-        messages.iter().any(
-            |message| message["role"] == "assistant" && message["content"] == "assistant-reply"
-        ),
-        "assistant reply should survive reload: {messages:?}"
-    );
-    assert!(
-        !messages.iter().any(|message| {
-            message["content"]
-                .as_str()
-                .map(|content| content.contains("\"event\":\"turn_checkpoint\""))
-                .unwrap_or(false)
-        }),
-        "checkpoint events must not pollute provider prompt history: {messages:?}"
-    );
-
-    let turns = crate::memory::window_direct(session_id, 16, &mem_config)
-        .expect("load raw turns from sqlite");
-    let assistant_contents = turns
-        .iter()
-        .filter_map(|turn| (turn.role == "assistant").then_some(turn.content.as_str()))
-        .collect::<Vec<_>>();
-    let summary = summarize_turn_checkpoint_events(assistant_contents.iter().copied());
-    assert_eq!(summary.checkpoint_events, 2);
-    assert_eq!(summary.latest_stage, Some(TurnCheckpointStage::Finalized));
-    assert_eq!(
-        summary.latest_after_turn,
-        Some(TurnCheckpointProgressStatus::Completed)
-    );
-    assert_eq!(
-        summary.latest_compaction,
-        Some(TurnCheckpointProgressStatus::Skipped)
-    );
-    assert_eq!(summary.latest_lane.as_deref(), Some("fast"));
-    assert_eq!(summary.latest_result_kind.as_deref(), Some("final_text"));
-    assert_eq!(summary.session_state, TurnCheckpointSessionState::Finalized);
-    assert!(summary.checkpoint_durable);
-    assert!(summary.reply_durable);
-    assert!(!summary.requires_recovery);
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[tokio::test]
-async fn load_turn_checkpoint_event_summary_reads_recovery_state_from_sqlite_history() {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-turn-checkpoint", "reader")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 8;
-
-    let session_id = "session-turn-checkpoint-reader";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "post_persist",
-                "checkpoint": {
-                    "lane": {
-                        "lane": "safe",
-                        "result_kind": "tool_call"
-                    },
-                    "finalization": {
-                        "persistence_mode": "error"
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "completed",
-                    "compaction": "pending"
-                },
-                "failure": null
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist post_persist checkpoint");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "finalization_failed",
-                "checkpoint": {
-                    "lane": {
-                        "lane": "safe",
-                        "result_kind": "tool_call"
-                    },
-                    "finalization": {
-                        "persistence_mode": "error"
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "completed",
-                    "compaction": "failed"
-                },
-                "failure": {
-                    "step": "compaction",
-                    "error": "context compaction failed"
-                }
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist failed checkpoint");
-
-    let summary = load_turn_checkpoint_event_summary(session_id, 32, None, &mem_config)
-        .await
-        .expect("load checkpoint event summary");
-
-    assert_eq!(summary.checkpoint_events, 2);
-    assert_eq!(
-        summary.session_state,
-        TurnCheckpointSessionState::FinalizationFailed
-    );
-    assert!(summary.checkpoint_durable);
-    assert_eq!(
-        summary.latest_stage,
-        Some(TurnCheckpointStage::FinalizationFailed)
-    );
-    assert_eq!(
-        summary.latest_after_turn,
-        Some(TurnCheckpointProgressStatus::Completed)
-    );
-    assert_eq!(
-        summary.latest_compaction,
-        Some(TurnCheckpointProgressStatus::Failed)
-    );
-    assert_eq!(
-        summary.latest_failure_step,
-        Some(TurnCheckpointFailureStep::Compaction)
-    );
-    assert_eq!(
-        summary.latest_failure_error.as_deref(),
-        Some("context compaction failed")
-    );
-    assert_eq!(summary.latest_lane.as_deref(), Some("safe"));
-    assert_eq!(summary.latest_result_kind.as_deref(), Some("tool_call"));
-    assert_eq!(summary.latest_persistence_mode.as_deref(), Some("error"));
-    assert!(summary.reply_durable);
-    assert!(summary.requires_recovery);
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn repair_turn_checkpoint_tail_with_runtime_finalizes_pending_checkpoint() {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-turn-checkpoint", "repair-pending")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 12;
-    config.conversation.compact_enabled = true;
-    config.conversation.compact_min_messages = Some(1);
-    config.conversation.compact_trigger_estimated_tokens = Some(1);
-    config.conversation.compact_fail_open = false;
-
-    let session_id = "session-turn-checkpoint-repair-pending";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "post_persist",
-                "checkpoint": {
-                    "identity": test_turn_checkpoint_identity("hello", "assistant-reply"),
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "pending",
-                    "compaction": "pending"
-                },
-                "failure": null
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist post_persist checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(
-        vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "hello"}),
-            json!({"role": "assistant", "content": "assistant-reply"}),
-        ],
-        vec![],
-        vec![],
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let outcome = coordinator
-        .repair_turn_checkpoint_tail_with_runtime(&config, session_id, &runtime, None)
-        .await
-        .expect("repair pending checkpoint");
-
-    assert_eq!(outcome.status().as_str(), "repaired");
-    assert_eq!(
-        outcome.source().map(|source| source.as_str()),
-        Some("runtime")
-    );
-    assert_eq!(outcome.action().as_str(), "run_after_turn_and_compaction");
-    assert_eq!(
-        runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .len(),
-        1
-    );
-    assert_eq!(runtime.compact_calls.lock().expect("compact lock").len(), 1);
-
-    let persisted = runtime.persisted.lock().expect("persisted lock");
-    let payloads = persisted_conversation_event_payloads_by_name(&persisted, "turn_checkpoint");
-    assert_eq!(payloads.len(), 1, "expected one repair checkpoint event");
-    assert_eq!(payloads[0]["stage"], "finalized");
-    assert_eq!(
-        payloads[0]["finalization_progress"]["after_turn"],
-        "completed"
-    );
-    assert_eq!(
-        payloads[0]["finalization_progress"]["compaction"],
-        "completed"
-    );
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn repair_turn_checkpoint_tail_with_runtime_requires_manual_repair_without_identity() {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-turn-checkpoint", "repair-missing-identity")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 12;
-    config.conversation.compact_enabled = true;
-    config.conversation.compact_min_messages = Some(1);
-    config.conversation.compact_trigger_estimated_tokens = Some(1);
-
-    let session_id = "session-turn-checkpoint-repair-missing-identity";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "post_persist",
-                "checkpoint": {
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "pending",
-                    "compaction": "pending"
-                },
-                "failure": null
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist post_persist checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(
-        vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "hello"}),
-            json!({"role": "assistant", "content": "assistant-reply"}),
-        ],
-        vec![],
-        vec![],
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let outcome = coordinator
-        .repair_turn_checkpoint_tail_with_runtime(&config, session_id, &runtime, None)
-        .await
-        .expect("repair should fail closed when identity is missing");
-
-    assert_eq!(outcome.status().as_str(), "manual_required");
-    assert_eq!(
-        outcome.source().map(|source| source.as_str()),
-        Some("summary")
-    );
-    assert_eq!(outcome.action().as_str(), "inspect_manually");
-    assert_eq!(
-        outcome.reason(),
-        TurnCheckpointTailRepairReason::CheckpointIdentityMissing
-    );
-    assert_eq!(
-        runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .len(),
-        0
-    );
-    assert_eq!(runtime.compact_calls.lock().expect("compact lock").len(), 0);
-    let persisted = runtime.persisted.lock().expect("persisted lock");
-    let payloads = persisted_conversation_event_payloads_by_name(&persisted, "turn_checkpoint");
-    assert!(
-        payloads.is_empty(),
-        "manual downgrade should not persist a new checkpoint event"
-    );
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn repair_turn_checkpoint_tail_with_runtime_preserves_safe_lane_override_reason_when_tail_is_not_runnable()
- {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id(
-            "conversation-turn-checkpoint",
-            "repair-safe-lane-override-manual-reason"
-        )
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 12;
-
-    let session_id = "session-turn-checkpoint-repair-safe-lane-override-manual-reason";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "post_persist",
-                "checkpoint": {
-                    "identity": {
-                        "user_input_sha256": "u1",
-                        "assistant_reply_sha256": "a1",
-                        "user_input_chars": 5,
-                        "assistant_reply_chars": 15
-                    },
-                    "lane": {
-                        "lane": "safe",
-                        "result_kind": "tool_error",
-                        "safe_lane_terminal_route": {
-                            "decision": "terminal",
-                            "reason": "backpressure_attempts_exhausted",
-                            "source": "backpressure_guard"
-                        }
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": false,
-                        "attempts_context_compaction": false
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "skipped",
-                    "compaction": "skipped"
-                },
-                "failure": null
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist post_persist checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(
-        vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "hello"}),
-            json!({"role": "assistant", "content": "assistant-reply"}),
-        ],
-        vec![],
-        vec![],
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let outcome = coordinator
-        .repair_turn_checkpoint_tail_with_runtime(&config, session_id, &runtime, None)
-        .await
-        .expect("repair should downgrade to manual inspection");
-
-    assert_eq!(outcome.status().as_str(), "manual_required");
-    assert_eq!(outcome.action().as_str(), "inspect_manually");
-    assert_eq!(
-        outcome.reason().as_str(),
-        "safe_lane_backpressure_terminal_requires_manual_inspection"
-    );
-    assert_eq!(
-        runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .len(),
-        0
-    );
-    assert_eq!(runtime.compact_calls.lock().expect("compact lock").len(), 0);
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn repair_turn_checkpoint_tail_with_runtime_requires_manual_repair_on_identity_mismatch() {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-turn-checkpoint", "repair-identity-mismatch")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 12;
-    config.conversation.compact_enabled = true;
-    config.conversation.compact_min_messages = Some(1);
-    config.conversation.compact_trigger_estimated_tokens = Some(1);
-
-    let session_id = "session-turn-checkpoint-repair-identity-mismatch";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "post_persist",
-                "checkpoint": {
-                    "identity": test_turn_checkpoint_identity("hello", "assistant-reply"),
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "pending",
-                    "compaction": "pending"
-                },
-                "failure": null
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist post_persist checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(
-        vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "hello"}),
-            json!({"role": "assistant", "content": "assistant-reply-mutated"}),
-        ],
-        vec![],
-        vec![],
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let outcome = coordinator
-        .repair_turn_checkpoint_tail_with_runtime(&config, session_id, &runtime, None)
-        .await
-        .expect("repair should fail closed on mismatched visible tail");
-
-    assert_eq!(outcome.status().as_str(), "manual_required");
-    assert_eq!(outcome.action().as_str(), "inspect_manually");
-    assert_eq!(
-        outcome.reason(),
-        TurnCheckpointTailRepairReason::CheckpointIdentityMismatch
-    );
-    assert_eq!(
-        runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .len(),
-        0
-    );
-    assert_eq!(runtime.compact_calls.lock().expect("compact lock").len(), 0);
-    let persisted = runtime.persisted.lock().expect("persisted lock");
-    let payloads = persisted_conversation_event_payloads_by_name(&persisted, "turn_checkpoint");
-    assert!(
-        payloads.is_empty(),
-        "mismatch downgrade should not persist a new checkpoint event"
-    );
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn repair_turn_checkpoint_tail_with_runtime_retries_failed_compaction_only() {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-turn-checkpoint", "repair-compaction")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 12;
-    config.conversation.compact_enabled = true;
-    config.conversation.compact_min_messages = Some(1);
-    config.conversation.compact_trigger_estimated_tokens = Some(1);
-
-    let session_id = "session-turn-checkpoint-repair-compaction";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "finalization_failed",
-                "checkpoint": {
-                    "identity": test_turn_checkpoint_identity("hello", "assistant-reply"),
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "completed",
-                    "compaction": "failed"
-                },
-                "failure": {
-                    "step": "compaction",
-                    "error": "compact failed"
-                }
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist failed checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(
-        vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "hello"}),
-            json!({"role": "assistant", "content": "assistant-reply"}),
-        ],
-        vec![],
-        vec![],
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let outcome = coordinator
-        .repair_turn_checkpoint_tail_with_runtime(&config, session_id, &runtime, None)
-        .await
-        .expect("repair failed compaction checkpoint");
-
-    assert_eq!(outcome.status().as_str(), "repaired");
-    assert_eq!(outcome.action().as_str(), "run_compaction");
-    assert_eq!(
-        runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .len(),
-        0
-    );
-    assert_eq!(runtime.compact_calls.lock().expect("compact lock").len(), 1);
-
-    let persisted = runtime.persisted.lock().expect("persisted lock");
-    let payloads = persisted_conversation_event_payloads_by_name(&persisted, "turn_checkpoint");
-    assert_eq!(payloads.len(), 1, "expected one repair checkpoint event");
-    assert_eq!(payloads[0]["stage"], "finalized");
-    assert_eq!(
-        payloads[0]["finalization_progress"]["after_turn"],
-        "completed"
-    );
-    assert_eq!(
-        payloads[0]["finalization_progress"]["compaction"],
-        "completed"
-    );
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn repair_turn_checkpoint_tail_rebuilds_original_finalization_context_for_compaction_retry() {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-turn-checkpoint", "repair-compaction-context")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 12;
-    config.conversation.compact_enabled = true;
-    config.conversation.compact_min_messages = Some(3);
-    config.conversation.compact_trigger_estimated_tokens = None;
-
-    let session_id = "session-turn-checkpoint-repair-compaction-context";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "finalization_failed",
-                "checkpoint": {
-                    "identity": test_turn_checkpoint_identity("hello", "assistant-reply"),
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "completed",
-                    "compaction": "failed"
-                },
-                "failure": {
-                    "step": "compaction",
-                    "error": "compact failed"
-                }
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist failed checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(vec![], vec![], vec![])
-        .with_assembled_context_variants(
-            AssembledConversationContext {
-                messages: vec![
-                    json!({"role": "system", "content": "sys"}),
-                    json!({"role": "user", "content": "hello"}),
-                    json!({"role": "assistant", "content": "assistant-reply"}),
-                ],
-                estimated_tokens: Some(3),
-                system_prompt_addition: None,
-            },
-            AssembledConversationContext {
-                messages: vec![
-                    json!({"role": "user", "content": "hello"}),
-                    json!({"role": "assistant", "content": "assistant-reply"}),
-                ],
-                estimated_tokens: Some(2),
-                system_prompt_addition: None,
-            },
-        );
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let outcome = coordinator
-        .repair_turn_checkpoint_tail_with_runtime(&config, session_id, &runtime, None)
-        .await
-        .expect("repair should replay compaction against original finalization context");
-
-    assert_eq!(outcome.status().as_str(), "repaired");
-    assert_eq!(outcome.action().as_str(), "run_compaction");
-    assert_eq!(
-        runtime
-            .build_context_calls
-            .lock()
-            .expect("build context lock")
-            .clone(),
-        vec![(session_id.to_owned(), true)]
-    );
-    assert_eq!(runtime.compact_calls.lock().expect("compact lock").len(), 1);
-
-    let persisted = runtime.persisted.lock().expect("persisted lock");
-    let payloads = persisted_conversation_event_payloads_by_name(&persisted, "turn_checkpoint");
-    assert_eq!(payloads.len(), 1, "expected one repair checkpoint event");
-    assert_eq!(payloads[0]["stage"], "finalized");
-    assert_eq!(
-        payloads[0]["finalization_progress"]["compaction"],
-        "completed"
-    );
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn repair_turn_checkpoint_tail_prefers_checkpoint_estimate_for_compaction_retry() {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-turn-checkpoint", "repair-compaction-estimate")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 12;
-    config.conversation.compact_enabled = true;
-    config.conversation.compact_min_messages = Some(999);
-    config.conversation.compact_trigger_estimated_tokens = Some(50);
-
-    let session_id = "session-turn-checkpoint-repair-compaction-estimate";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "finalization_failed",
-                "checkpoint": {
-                    "identity": test_turn_checkpoint_identity("hello", "assistant-reply"),
-                    "preparation": {
-                        "estimated_tokens": 60
-                    },
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "completed",
-                    "compaction": "failed"
-                },
-                "failure": {
-                    "step": "compaction",
-                    "error": "compact failed"
-                }
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist failed checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(vec![], vec![], vec![])
-        .with_assembled_context(AssembledConversationContext {
-            messages: vec![
-                json!({"role": "system", "content": "sys"}),
-                json!({"role": "user", "content": "hello"}),
-                json!({"role": "assistant", "content": "assistant-reply"}),
-            ],
-            estimated_tokens: Some(1),
-            system_prompt_addition: None,
-        });
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let outcome = coordinator
-        .repair_turn_checkpoint_tail_with_runtime(&config, session_id, &runtime, None)
-        .await
-        .expect("repair should reuse checkpoint estimate for compaction retry");
-
-    assert_eq!(outcome.status().as_str(), "repaired");
-    assert_eq!(outcome.action().as_str(), "run_compaction");
-    assert_eq!(runtime.compact_calls.lock().expect("compact lock").len(), 1);
-
-    let persisted = runtime.persisted.lock().expect("persisted lock");
-    let payloads = persisted_conversation_event_payloads_by_name(&persisted, "turn_checkpoint");
-    assert_eq!(payloads.len(), 1, "expected one repair checkpoint event");
-    assert_eq!(payloads[0]["stage"], "finalized");
-    assert_eq!(
-        payloads[0]["finalization_progress"]["compaction"],
-        "completed"
-    );
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn probe_turn_checkpoint_tail_runtime_gate_reports_preparation_content_mismatch() {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id(
-            "conversation-turn-checkpoint",
-            "probe-context-fingerprint-mismatch"
-        )
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 12;
-    config.conversation.compact_enabled = true;
-    config.conversation.compact_min_messages = Some(1);
-    config.conversation.compact_trigger_estimated_tokens = Some(1);
-
-    let session_id = "session-turn-checkpoint-probe-context-fingerprint-mismatch";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "finalization_failed",
-                "checkpoint": {
-                    "identity": test_turn_checkpoint_identity("hello", "assistant-reply"),
-                    "preparation": {
-                        "context_message_count": 2,
-                        "context_fingerprint_sha256": test_turn_preparation_context_fingerprint(&[
-                            json!({"role": "system", "content": "sys"}),
-                            json!({"role": "user", "content": "hello"}),
-                        ]),
-                        "estimated_tokens": 16
-                    },
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "completed",
-                    "compaction": "failed"
-                },
-                "failure": {
-                    "step": "compaction",
-                    "error": "compact failed"
-                }
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist failed checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(vec![], vec![], vec![])
-        .with_assembled_context(AssembledConversationContext {
-            messages: vec![
-                json!({"role": "system", "content": "summary drift"}),
-                json!({"role": "user", "content": "hello"}),
-                json!({"role": "assistant", "content": "assistant-reply"}),
-            ],
-            estimated_tokens: Some(99),
-            system_prompt_addition: None,
-        });
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let probe = coordinator
-        .probe_turn_checkpoint_tail_runtime_gate_with_runtime(&config, session_id, &runtime, None)
-        .await
-        .expect("runtime probe should succeed")
-        .expect("fingerprint drift should produce a runtime probe");
-
-    assert_eq!(probe.action().as_str(), "inspect_manually");
-    assert_eq!(probe.source().as_str(), "runtime");
-    assert_eq!(
-        probe.reason().as_str(),
-        "checkpoint_preparation_fingerprint_mismatch"
-    );
-    assert_eq!(
-        runtime
-            .build_context_calls
-            .lock()
-            .expect("build context lock")
-            .as_slice(),
-        &[(session_id.to_owned(), true)]
-    );
-    assert_eq!(
-        runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .len(),
-        0
-    );
-    assert_eq!(runtime.compact_calls.lock().expect("compact lock").len(), 0);
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn probe_turn_checkpoint_tail_runtime_gate_returns_none_when_repair_not_needed() {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-turn-checkpoint", "probe-not-needed")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 12;
-
-    let session_id = "session-turn-checkpoint-probe-not-needed";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "finalized",
-                "checkpoint": {
-                    "identity": test_turn_checkpoint_identity("hello", "assistant-reply"),
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "completed",
-                    "compaction": "completed"
-                },
-                "failure": null
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist finalized checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(
-        vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "hello"}),
-            json!({"role": "assistant", "content": "assistant-reply"}),
-        ],
-        vec![],
-        vec![],
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let probe = coordinator
-        .probe_turn_checkpoint_tail_runtime_gate_with_runtime(&config, session_id, &runtime, None)
-        .await
-        .expect("not-needed probe should succeed");
-
-    assert!(probe.is_none());
-    assert!(
-        runtime
-            .build_context_calls
-            .lock()
-            .expect("build context lock")
-            .is_empty()
-    );
-    assert!(runtime.persisted.lock().expect("persisted lock").is_empty());
-    assert_eq!(
-        runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .len(),
-        0
-    );
-    assert_eq!(runtime.compact_calls.lock().expect("compact lock").len(), 0);
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn probe_turn_checkpoint_tail_runtime_gate_returns_none_for_summary_manual_repair() {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-turn-checkpoint", "probe-summary-manual")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 12;
-
-    let session_id = "session-turn-checkpoint-probe-summary-manual";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "post_persist",
-                "checkpoint": {
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "pending",
-                    "compaction": "pending"
-                },
-                "failure": null
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist summary-manual checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(
-        vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "hello"}),
-            json!({"role": "assistant", "content": "assistant-reply"}),
-        ],
-        vec![],
-        vec![],
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let probe = coordinator
-        .probe_turn_checkpoint_tail_runtime_gate_with_runtime(&config, session_id, &runtime, None)
-        .await
-        .expect("summary-manual probe should succeed");
-
-    assert!(probe.is_none());
-    assert!(
-        runtime
-            .build_context_calls
-            .lock()
-            .expect("build context lock")
-            .is_empty(),
-        "summary-derived manual downgrade must stop before runtime context assembly"
-    );
-    assert!(runtime.persisted.lock().expect("persisted lock").is_empty());
-    assert_eq!(
-        runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .len(),
-        0
-    );
-    assert_eq!(runtime.compact_calls.lock().expect("compact lock").len(), 0);
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn probe_turn_checkpoint_tail_runtime_gate_returns_none_for_runnable_repair() {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-turn-checkpoint", "probe-runnable")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 12;
-
-    let session_id = "session-turn-checkpoint-probe-runnable";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "post_persist",
-                "checkpoint": {
-                    "identity": test_turn_checkpoint_identity("hello", "assistant-reply"),
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "pending",
-                    "compaction": "pending"
-                },
-                "failure": null
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist runnable checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(
-        vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "hello"}),
-            json!({"role": "assistant", "content": "assistant-reply"}),
-        ],
-        vec![],
-        vec![],
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let probe = coordinator
-        .probe_turn_checkpoint_tail_runtime_gate_with_runtime(&config, session_id, &runtime, None)
-        .await
-        .expect("runnable probe should succeed");
-
-    assert!(probe.is_none());
-    assert_eq!(
-        runtime
-            .build_context_calls
-            .lock()
-            .expect("build context lock")
-            .as_slice(),
-        &[(session_id.to_owned(), true)],
-        "runnable repair should validate runtime context but remain read-only"
-    );
-    assert!(runtime.persisted.lock().expect("persisted lock").is_empty());
-    assert_eq!(
-        runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .len(),
-        0
-    );
-    assert_eq!(runtime.compact_calls.lock().expect("compact lock").len(), 0);
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn load_turn_checkpoint_diagnostics_with_runtime_preserves_summary_manual_assessment() {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-turn-checkpoint", "diagnostics-summary-manual")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 12;
-
-    let session_id = "session-turn-checkpoint-diagnostics-summary-manual";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "post_persist",
-                "checkpoint": {
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "pending",
-                    "compaction": "pending"
-                },
-                "failure": null
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist summary-manual checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(
-        vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "hello"}),
-            json!({"role": "assistant", "content": "assistant-reply"}),
-        ],
-        vec![],
-        vec![],
-    );
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let diagnostics = coordinator
-        .load_turn_checkpoint_diagnostics_with_runtime_and_limit(
-            &config, session_id, 12, &runtime, None,
-        )
-        .await
-        .expect("diagnostics should load");
-
-    assert_eq!(
-        diagnostics.summary().session_state,
-        TurnCheckpointSessionState::PendingFinalization
-    );
-    assert_eq!(
-        diagnostics.recovery().action(),
-        TurnCheckpointRecoveryAction::InspectManually
-    );
-    assert_eq!(
-        diagnostics.recovery().source(),
-        TurnCheckpointTailRepairSource::Summary
-    );
-    assert_eq!(
-        diagnostics.recovery().reason(),
-        Some(TurnCheckpointTailRepairReason::CheckpointIdentityMissing)
-    );
-    assert!(diagnostics.runtime_probe().is_none());
-    assert!(
-        runtime
-            .build_context_calls
-            .lock()
-            .expect("build context lock")
-            .is_empty(),
-        "summary-derived manual assessment must not assemble runtime context"
-    );
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn load_turn_checkpoint_diagnostics_with_runtime_preserves_summary_assessment_and_runtime_probe()
- {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-turn-checkpoint", "diagnostics-runtime-drift")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 12;
-    config.conversation.compact_enabled = true;
-    config.conversation.compact_min_messages = Some(1);
-    config.conversation.compact_trigger_estimated_tokens = Some(1);
-
-    let session_id = "session-turn-checkpoint-diagnostics-runtime-drift";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "finalization_failed",
-                "checkpoint": {
-                    "identity": test_turn_checkpoint_identity("hello", "assistant-reply"),
-                    "preparation": {
-                        "context_message_count": 2,
-                        "context_fingerprint_sha256": test_turn_preparation_context_fingerprint(&[
-                            json!({"role": "system", "content": "sys"}),
-                            json!({"role": "user", "content": "hello"}),
-                        ]),
-                        "estimated_tokens": 16
-                    },
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "completed",
-                    "compaction": "failed"
-                },
-                "failure": {
-                    "step": "compaction",
-                    "error": "compact failed"
-                }
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist failed checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(vec![], vec![], vec![])
-        .with_assembled_context(AssembledConversationContext {
-            messages: vec![
-                json!({"role": "system", "content": "summary drift"}),
-                json!({"role": "user", "content": "hello"}),
-                json!({"role": "assistant", "content": "assistant-reply"}),
-            ],
-            estimated_tokens: Some(99),
-            system_prompt_addition: None,
-        });
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let diagnostics = coordinator
-        .load_turn_checkpoint_diagnostics_with_runtime_and_limit(
-            &config, session_id, 12, &runtime, None,
-        )
-        .await
-        .expect("diagnostics should load");
-
-    assert_eq!(
-        diagnostics.summary().session_state,
-        TurnCheckpointSessionState::FinalizationFailed
-    );
-    assert_eq!(
-        diagnostics.recovery().action(),
-        TurnCheckpointRecoveryAction::RunCompaction
-    );
-    assert_eq!(
-        diagnostics.recovery().source(),
-        TurnCheckpointTailRepairSource::Summary
-    );
-    assert_eq!(diagnostics.recovery().reason(), None);
-
-    let runtime_probe = diagnostics
-        .runtime_probe()
-        .expect("runtime drift should surface a probe");
-    assert_eq!(runtime_probe.action().as_str(), "inspect_manually");
-    assert_eq!(runtime_probe.source().as_str(), "runtime");
-    assert_eq!(
-        runtime_probe.reason(),
-        TurnCheckpointTailRepairReason::CheckpointPreparationFingerprintMismatch
-    );
-    assert_eq!(
-        runtime
-            .build_context_calls
-            .lock()
-            .expect("build context lock")
-            .as_slice(),
-        &[(session_id.to_owned(), true)]
-    );
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn load_turn_checkpoint_diagnostics_uses_single_kernel_window_snapshot_for_summary_and_runtime_probe()
- {
-    let first_window_turns = json!([
-        {
-            "role": "assistant",
-            "content": json!({
-                "type": "conversation_event",
-                "event": "turn_checkpoint",
-                "payload": {
-                    "schema_version": 1,
-                    "stage": "finalization_failed",
-                    "checkpoint": {
-                        "identity": test_turn_checkpoint_identity("hello", "assistant-reply"),
-                        "preparation": {
-                            "context_message_count": 2,
-                            "context_fingerprint_sha256": test_turn_preparation_context_fingerprint(&[
-                                json!({"role": "system", "content": "different-system"}),
-                                json!({"role": "user", "content": "hello"}),
-                            ]),
-                            "estimated_tokens": 16
-                        },
-                        "lane": {
-                            "lane": "fast",
-                            "result_kind": "final_text"
-                        },
-                        "finalization": {
-                            "persistence_mode": "success",
-                            "runs_after_turn": true,
-                            "attempts_context_compaction": true
-                        }
-                    },
-                    "finalization_progress": {
-                        "after_turn": "completed",
-                        "compaction": "failed"
-                    },
-                    "failure": {
-                        "step": "compaction",
-                        "error": "compact failed"
-                    }
-                }
-            })
-            .to_string(),
-            "ts": 1
-        }
-    ]);
-    let second_window_turns = json!([
-        {
-            "role": "assistant",
-            "content": "stale-drift-without-checkpoint",
-            "ts": 2
-        }
-    ]);
-    let audit = Arc::new(InMemoryAuditSink::default());
-    let (ctx, invocations) = build_kernel_context_with_window_turn_sequence(
-        audit,
-        vec![first_window_turns, second_window_turns],
-    );
-
-    let mut config = test_config();
-    config.memory.sliding_window = 12;
-    config.conversation.compact_enabled = true;
-    config.conversation.compact_min_messages = Some(1);
-    config.conversation.compact_trigger_estimated_tokens = Some(1);
-
-    let session_id = "session-turn-checkpoint-diagnostics-kernel-single-window";
-    let runtime = FakeRuntime::with_turns_and_completions(vec![], vec![], vec![])
-        .with_assembled_context(AssembledConversationContext {
-            messages: vec![
-                json!({"role": "system", "content": "summary drift"}),
-                json!({"role": "user", "content": "hello"}),
-                json!({"role": "assistant", "content": "assistant-reply"}),
-            ],
-            estimated_tokens: Some(99),
-            system_prompt_addition: None,
-        });
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let diagnostics = coordinator
-        .load_turn_checkpoint_diagnostics_with_runtime_and_limit(
-            &config,
-            session_id,
-            12,
-            &runtime,
-            Some(&ctx),
-        )
-        .await
-        .expect("diagnostics should load from one kernel window snapshot");
-
-    assert_eq!(
-        diagnostics.summary().session_state,
-        TurnCheckpointSessionState::FinalizationFailed
-    );
-    assert_eq!(
-        diagnostics.recovery().action(),
-        TurnCheckpointRecoveryAction::RunCompaction
-    );
-    assert_eq!(
-        diagnostics.recovery().source(),
-        TurnCheckpointTailRepairSource::Summary
-    );
-    assert_eq!(diagnostics.recovery().reason(), None);
-
-    let runtime_probe = diagnostics
-        .runtime_probe()
-        .expect("runtime probe should use the same checkpoint snapshot");
-    assert_eq!(runtime_probe.action().as_str(), "inspect_manually");
-    assert_eq!(runtime_probe.source().as_str(), "runtime");
-    assert_eq!(
-        runtime_probe.reason(),
-        TurnCheckpointTailRepairReason::CheckpointPreparationFingerprintMismatch
-    );
-
-    let captured = invocations.lock().expect("invocations lock");
-    let window_calls = captured
-        .iter()
-        .filter(|request| request.operation == MEMORY_OP_WINDOW)
-        .count();
-    assert_eq!(
-        window_calls, 1,
-        "diagnostics should reuse one kernel window snapshot for summary and runtime probe"
-    );
-    assert_eq!(
-        runtime
-            .build_context_calls
-            .lock()
-            .expect("build context lock")
-            .as_slice(),
-        &[(session_id.to_owned(), true)]
-    );
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn repair_turn_checkpoint_tail_requires_manual_repair_on_preparation_context_mismatch() {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-turn-checkpoint", "repair-context-mismatch")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 12;
-    config.conversation.compact_enabled = true;
-    config.conversation.compact_min_messages = Some(1);
-    config.conversation.compact_trigger_estimated_tokens = Some(1);
-
-    let session_id = "session-turn-checkpoint-repair-context-mismatch";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "finalization_failed",
-                "checkpoint": {
-                    "identity": test_turn_checkpoint_identity("hello", "assistant-reply"),
-                    "preparation": {
-                        "context_message_count": 2,
-                        "estimated_tokens": 16
-                    },
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "completed",
-                    "compaction": "failed"
-                },
-                "failure": {
-                    "step": "compaction",
-                    "error": "compact failed"
-                }
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist failed checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(vec![], vec![], vec![])
-        .with_assembled_context(AssembledConversationContext {
-            messages: vec![
-                json!({"role": "system", "content": "sys"}),
-                json!({"role": "system", "content": "summary drift"}),
-                json!({"role": "user", "content": "hello"}),
-                json!({"role": "assistant", "content": "assistant-reply"}),
-            ],
-            estimated_tokens: Some(99),
-            system_prompt_addition: None,
-        });
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let outcome = coordinator
-        .repair_turn_checkpoint_tail_with_runtime(&config, session_id, &runtime, None)
-        .await
-        .expect("context drift should downgrade to manual repair");
-
-    assert_eq!(outcome.status().as_str(), "manual_required");
-    assert_eq!(outcome.action().as_str(), "inspect_manually");
-    assert_eq!(
-        outcome.reason(),
-        TurnCheckpointTailRepairReason::CheckpointPreparationMismatch
-    );
-    assert_eq!(
-        runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .len(),
-        0
-    );
-    assert_eq!(runtime.compact_calls.lock().expect("compact lock").len(), 0);
-
-    let persisted = runtime.persisted.lock().expect("persisted lock");
-    let payloads = persisted_conversation_event_payloads_by_name(&persisted, "turn_checkpoint");
-    assert!(
-        payloads.is_empty(),
-        "preparation mismatch downgrade should not persist a new checkpoint event"
-    );
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn repair_turn_checkpoint_tail_requires_manual_repair_on_preparation_content_mismatch() {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id(
-            "conversation-turn-checkpoint",
-            "repair-context-fingerprint-mismatch"
-        )
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 12;
-    config.conversation.compact_enabled = true;
-    config.conversation.compact_min_messages = Some(1);
-    config.conversation.compact_trigger_estimated_tokens = Some(1);
-
-    let session_id = "session-turn-checkpoint-repair-context-fingerprint-mismatch";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "finalization_failed",
-                "checkpoint": {
-                    "identity": test_turn_checkpoint_identity("hello", "assistant-reply"),
-                    "preparation": {
-                        "context_message_count": 2,
-                        "context_fingerprint_sha256": test_turn_preparation_context_fingerprint(&[
-                            json!({"role": "system", "content": "sys"}),
-                            json!({"role": "user", "content": "hello"}),
-                        ]),
-                        "estimated_tokens": 16
-                    },
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "completed",
-                    "compaction": "failed"
-                },
-                "failure": {
-                    "step": "compaction",
-                    "error": "compact failed"
-                }
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist failed checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(vec![], vec![], vec![])
-        .with_assembled_context(AssembledConversationContext {
-            messages: vec![
-                json!({"role": "system", "content": "summary drift"}),
-                json!({"role": "user", "content": "hello"}),
-                json!({"role": "assistant", "content": "assistant-reply"}),
-            ],
-            estimated_tokens: Some(99),
-            system_prompt_addition: None,
-        });
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let outcome = coordinator
-        .repair_turn_checkpoint_tail_with_runtime(&config, session_id, &runtime, None)
-        .await
-        .expect("content drift should downgrade to manual repair");
-
-    assert_eq!(outcome.status().as_str(), "manual_required");
-    assert_eq!(
-        outcome.source().map(|source| source.as_str()),
-        Some("runtime")
-    );
-    assert_eq!(outcome.action().as_str(), "inspect_manually");
-    assert_eq!(
-        outcome.reason().as_str(),
-        "checkpoint_preparation_fingerprint_mismatch"
-    );
-    assert_eq!(
-        runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .len(),
-        0
-    );
-    assert_eq!(runtime.compact_calls.lock().expect("compact lock").len(), 0);
-
-    let persisted = runtime.persisted.lock().expect("persisted lock");
-    let payloads = persisted_conversation_event_payloads_by_name(&persisted, "turn_checkpoint");
-    assert!(
-        payloads.is_empty(),
-        "preparation fingerprint mismatch downgrade should not persist a new checkpoint event"
-    );
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn repair_turn_checkpoint_tail_requires_manual_repair_on_malformed_preparation_snapshot() {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id(
-            "conversation-turn-checkpoint",
-            "repair-preparation-malformed"
-        )
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 12;
-    config.conversation.compact_enabled = true;
-    config.conversation.compact_min_messages = Some(1);
-    config.conversation.compact_trigger_estimated_tokens = Some(1);
-
-    let session_id = "session-turn-checkpoint-repair-preparation-malformed";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "finalization_failed",
-                "checkpoint": {
-                    "identity": test_turn_checkpoint_identity("hello", "assistant-reply"),
-                    "preparation": {
-                        "context_message_count": "two",
-                        "estimated_tokens": 16
-                    },
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "completed",
-                    "compaction": "failed"
-                },
-                "failure": {
-                    "step": "compaction",
-                    "error": "compact failed"
-                }
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist failed checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(vec![], vec![], vec![])
-        .with_assembled_context(AssembledConversationContext {
-            messages: vec![
-                json!({"role": "system", "content": "sys"}),
-                json!({"role": "user", "content": "hello"}),
-                json!({"role": "assistant", "content": "assistant-reply"}),
-            ],
-            estimated_tokens: Some(99),
-            system_prompt_addition: None,
-        });
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let outcome = coordinator
-        .repair_turn_checkpoint_tail_with_runtime(&config, session_id, &runtime, None)
-        .await
-        .expect("malformed preparation should downgrade to manual repair");
-
-    assert_eq!(outcome.status().as_str(), "manual_required");
-    assert_eq!(outcome.action().as_str(), "inspect_manually");
-    assert_eq!(
-        outcome.reason(),
-        TurnCheckpointTailRepairReason::CheckpointPreparationMalformed
-    );
-    assert_eq!(
-        runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .len(),
-        0
-    );
-    assert_eq!(runtime.compact_calls.lock().expect("compact lock").len(), 0);
-
-    let persisted = runtime.persisted.lock().expect("persisted lock");
-    let payloads = persisted_conversation_event_payloads_by_name(&persisted, "turn_checkpoint");
-    assert!(
-        payloads.is_empty(),
-        "malformed preparation downgrade should not persist a new checkpoint event"
-    );
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn repair_turn_checkpoint_tail_with_runtime_persists_failed_after_turn_repair() {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-turn-checkpoint", "repair-after-turn-fail")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 12;
-    config.conversation.compact_enabled = true;
-    config.conversation.compact_min_messages = Some(1);
-    config.conversation.compact_trigger_estimated_tokens = Some(1);
-
-    let session_id = "session-turn-checkpoint-repair-after-turn-fail";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "post_persist",
-                "checkpoint": {
-                    "identity": test_turn_checkpoint_identity("hello", "assistant-reply"),
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "pending",
-                    "compaction": "pending"
-                },
-                "failure": null
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist post_persist checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(
-        vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "hello"}),
-            json!({"role": "assistant", "content": "assistant-reply"}),
-        ],
-        vec![],
-        vec![],
-    )
-    .with_after_turn_result(Err("repair after_turn failed".to_owned()));
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let error = coordinator
-        .repair_turn_checkpoint_tail_with_runtime(&config, session_id, &runtime, None)
-        .await
-        .expect_err("after_turn repair should fail closed");
-    assert!(error.contains("repair after_turn failed"));
-    assert_eq!(
-        runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .len(),
-        1
-    );
-    assert_eq!(runtime.compact_calls.lock().expect("compact lock").len(), 0);
-
-    let persisted = runtime.persisted.lock().expect("persisted lock");
-    let payloads = persisted_conversation_event_payloads_by_name(&persisted, "turn_checkpoint");
-    assert_eq!(
-        payloads.len(),
-        1,
-        "expected one failed repair checkpoint event"
-    );
-    assert_eq!(payloads[0]["stage"], "finalization_failed");
-    assert_eq!(payloads[0]["finalization_progress"]["after_turn"], "failed");
-    assert_eq!(
-        payloads[0]["finalization_progress"]["compaction"],
-        "skipped"
-    );
-    assert_eq!(payloads[0]["failure"]["step"], "after_turn");
-    assert_eq!(payloads[0]["failure"]["error"], "repair after_turn failed");
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn repair_turn_checkpoint_tail_with_runtime_persists_failed_compaction_repair() {
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-turn-checkpoint", "repair-compaction-fail")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 12;
-    config.conversation.compact_enabled = true;
-    config.conversation.compact_min_messages = Some(1);
-    config.conversation.compact_trigger_estimated_tokens = Some(1);
-    config.conversation.compact_fail_open = false;
-
-    let session_id = "session-turn-checkpoint-repair-compaction-fail";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "finalization_failed",
-                "checkpoint": {
-                    "identity": test_turn_checkpoint_identity("hello", "assistant-reply"),
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "completed",
-                    "compaction": "failed"
-                },
-                "failure": {
-                    "step": "compaction",
-                    "error": "compact failed"
-                }
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist failed checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(
-        vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "hello"}),
-            json!({"role": "assistant", "content": "assistant-reply"}),
-        ],
-        vec![],
-        vec![],
-    )
-    .with_compact_result(Err("repair compaction failed".to_owned()));
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let error = coordinator
-        .repair_turn_checkpoint_tail_with_runtime(&config, session_id, &runtime, None)
-        .await
-        .expect_err("compaction repair should fail closed");
-    assert!(error.contains("repair compaction failed"));
-    assert_eq!(
-        runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .len(),
-        0
-    );
-    assert_eq!(runtime.compact_calls.lock().expect("compact lock").len(), 1);
-
-    let persisted = runtime.persisted.lock().expect("persisted lock");
-    let payloads = persisted_conversation_event_payloads_by_name(&persisted, "turn_checkpoint");
-    assert_eq!(
-        payloads.len(),
-        1,
-        "expected one failed repair checkpoint event"
-    );
-    assert_eq!(payloads[0]["stage"], "finalization_failed");
-    assert_eq!(
-        payloads[0]["finalization_progress"]["after_turn"],
-        "completed"
-    );
-    assert_eq!(payloads[0]["finalization_progress"]["compaction"], "failed");
-    assert_eq!(payloads[0]["failure"]["step"], "compaction");
-    assert_eq!(payloads[0]["failure"]["error"], "repair compaction failed");
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn durable_turn_checkpoint_repair_persists_finalized_checkpoint_and_repeated_repair_is_noop()
-{
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-turn-checkpoint", "durable-repair-idempotent")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 16;
-    config.conversation.compact_enabled = true;
-    config.conversation.compact_min_messages = Some(1);
-    config.conversation.compact_trigger_estimated_tokens = Some(1);
-    config.conversation.compact_fail_open = false;
-
-    let session_id = "session-turn-checkpoint-durable-repair-idempotent";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "post_persist",
-                "checkpoint": {
-                    "identity": test_turn_checkpoint_identity("hello", "assistant-reply"),
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "pending",
-                    "compaction": "pending"
-                },
-                "failure": null
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist pending checkpoint");
-
-    let runtime = FakeRuntime::with_turns_and_completions(
-        vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "hello"}),
-            json!({"role": "assistant", "content": "assistant-reply"}),
-        ],
-        vec![],
-        vec![],
-    )
-    .with_durable_memory_config(mem_config.clone());
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let first = coordinator
-        .repair_turn_checkpoint_tail_with_runtime(&config, session_id, &runtime, None)
-        .await
-        .expect("first durable repair should succeed");
-    assert_eq!(first.status().as_str(), "repaired");
-    assert_eq!(first.action().as_str(), "run_after_turn_and_compaction");
-    assert_eq!(first.reason(), TurnCheckpointTailRepairReason::Repaired);
-    assert_eq!(
-        runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .len(),
-        1
-    );
-    assert_eq!(runtime.compact_calls.lock().expect("compact lock").len(), 1);
-
-    let summary_after_first = load_turn_checkpoint_event_summary(session_id, 32, None, &mem_config)
-        .await
-        .expect("load summary after first durable repair");
-    assert_eq!(summary_after_first.checkpoint_events, 2);
-    assert_eq!(
-        summary_after_first.latest_stage,
-        Some(TurnCheckpointStage::Finalized)
-    );
-    assert_eq!(
-        summary_after_first.latest_after_turn,
-        Some(TurnCheckpointProgressStatus::Completed)
-    );
-    assert_eq!(
-        summary_after_first.latest_compaction,
-        Some(TurnCheckpointProgressStatus::Completed)
-    );
-    assert_eq!(summary_after_first.latest_identity_present, Some(true));
-    assert!(!summary_after_first.requires_recovery);
-
-    let second = coordinator
-        .repair_turn_checkpoint_tail_with_runtime(&config, session_id, &runtime, None)
-        .await
-        .expect("second durable repair should be a noop");
-    assert_eq!(second.status().as_str(), "not_needed");
-    assert_eq!(second.action().as_str(), "none");
-    assert_eq!(second.reason(), TurnCheckpointTailRepairReason::NotNeeded);
-    assert_eq!(
-        runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .len(),
-        1,
-        "repeated repair must not rerun after_turn"
-    );
-    assert_eq!(
-        runtime.compact_calls.lock().expect("compact lock").len(),
-        1,
-        "repeated repair must not rerun compaction"
-    );
-
-    let summary_after_second =
-        load_turn_checkpoint_event_summary(session_id, 32, None, &mem_config)
-            .await
-            .expect("load summary after second durable repair");
-    assert_eq!(summary_after_second.checkpoint_events, 2);
-    assert_eq!(
-        summary_after_second.latest_stage,
-        Some(TurnCheckpointStage::Finalized)
-    );
-    assert!(!summary_after_second.requires_recovery);
-
-    let _ = std::fs::remove_file(&db_path);
-}
-
-#[cfg(feature = "memory-sqlite")]
-#[tokio::test]
-async fn durable_turn_checkpoint_repair_persists_failed_terminal_checkpoint_then_recovers_on_retry()
-{
-    let db_path = std::env::temp_dir().join(format!(
-        "{}.sqlite3",
-        unique_acp_test_id("conversation-turn-checkpoint", "durable-repair-retry")
-    ));
-    let _ = std::fs::remove_file(&db_path);
-
-    let mut config = test_config();
-    config.memory.sqlite_path = db_path.display().to_string();
-    config.memory.sliding_window = 16;
-    config.conversation.compact_enabled = true;
-    config.conversation.compact_min_messages = Some(1);
-    config.conversation.compact_trigger_estimated_tokens = Some(1);
-    config.conversation.compact_fail_open = false;
-
-    let session_id = "session-turn-checkpoint-durable-repair-retry";
-    let mem_config = MemoryRuntimeConfig::from_memory_config(&config.memory);
-
-    crate::memory::append_turn_direct(session_id, "user", "hello", &mem_config)
-        .expect("persist user turn");
-    crate::memory::append_turn_direct(session_id, "assistant", "assistant-reply", &mem_config)
-        .expect("persist assistant turn");
-    crate::memory::append_turn_direct(
-        session_id,
-        "assistant",
-        &json!({
-            "type": "conversation_event",
-            "event": "turn_checkpoint",
-            "payload": {
-                "schema_version": 1,
-                "stage": "post_persist",
-                "checkpoint": {
-                    "identity": test_turn_checkpoint_identity("hello", "assistant-reply"),
-                    "lane": {
-                        "lane": "fast",
-                        "result_kind": "final_text"
-                    },
-                    "finalization": {
-                        "persistence_mode": "success",
-                        "runs_after_turn": true,
-                        "attempts_context_compaction": true
-                    }
-                },
-                "finalization_progress": {
-                    "after_turn": "pending",
-                    "compaction": "pending"
-                },
-                "failure": null
-            }
-        })
-        .to_string(),
-        &mem_config,
-    )
-    .expect("persist pending checkpoint");
-
-    let failing_runtime = FakeRuntime::with_turns_and_completions(
-        vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "hello"}),
-            json!({"role": "assistant", "content": "assistant-reply"}),
-        ],
-        vec![],
-        vec![],
-    )
-    .with_durable_memory_config(mem_config.clone())
-    .with_compact_result(Err("durable repair compaction failed".to_owned()));
-    let coordinator = ConversationTurnCoordinator::new();
-
-    let error = coordinator
-        .repair_turn_checkpoint_tail_with_runtime(&config, session_id, &failing_runtime, None)
-        .await
-        .expect_err("first durable repair should persist failure and return error");
-    assert!(error.contains("durable repair compaction failed"));
-    assert_eq!(
-        failing_runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .len(),
-        1
-    );
-    assert_eq!(
-        failing_runtime
-            .compact_calls
-            .lock()
-            .expect("compact lock")
-            .len(),
-        1
-    );
-
-    let summary_after_failure =
-        load_turn_checkpoint_event_summary(session_id, 32, None, &mem_config)
-            .await
-            .expect("load summary after durable failure");
-    assert_eq!(summary_after_failure.checkpoint_events, 2);
-    assert_eq!(
-        summary_after_failure.latest_stage,
-        Some(TurnCheckpointStage::FinalizationFailed)
-    );
-    assert_eq!(
-        summary_after_failure.latest_after_turn,
-        Some(TurnCheckpointProgressStatus::Completed)
-    );
-    assert_eq!(
-        summary_after_failure.latest_compaction,
-        Some(TurnCheckpointProgressStatus::Failed)
-    );
-    assert_eq!(summary_after_failure.latest_identity_present, Some(true));
-    assert!(summary_after_failure.requires_recovery);
-    assert_eq!(
-        plan_turn_checkpoint_recovery(&summary_after_failure),
-        TurnCheckpointRecoveryAction::RunCompaction
-    );
-
-    let retry_runtime = FakeRuntime::with_turns_and_completions(
-        vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "hello"}),
-            json!({"role": "assistant", "content": "assistant-reply"}),
-        ],
-        vec![],
-        vec![],
-    )
-    .with_durable_memory_config(mem_config.clone());
-
-    let retry = coordinator
-        .repair_turn_checkpoint_tail_with_runtime(&config, session_id, &retry_runtime, None)
-        .await
-        .expect("second durable repair should recover");
-    assert_eq!(retry.status().as_str(), "repaired");
-    assert_eq!(retry.action().as_str(), "run_compaction");
-    assert_eq!(retry.reason(), TurnCheckpointTailRepairReason::Repaired);
-    assert_eq!(
-        retry_runtime
-            .after_turn_calls
-            .lock()
-            .expect("after-turn lock")
-            .len(),
-        0,
-        "compaction-only retry must not rerun after_turn"
-    );
-    assert_eq!(
-        retry_runtime
-            .compact_calls
-            .lock()
-            .expect("compact lock")
-            .len(),
-        1
-    );
-
-    let summary_after_retry = load_turn_checkpoint_event_summary(session_id, 32, None, &mem_config)
-        .await
-        .expect("load summary after durable retry");
-    assert_eq!(summary_after_retry.checkpoint_events, 3);
-    assert_eq!(
-        summary_after_retry.latest_stage,
-        Some(TurnCheckpointStage::Finalized)
-    );
-    assert_eq!(
-        summary_after_retry.latest_after_turn,
-        Some(TurnCheckpointProgressStatus::Completed)
-    );
-    assert_eq!(
-        summary_after_retry.latest_compaction,
-        Some(TurnCheckpointProgressStatus::Completed)
-    );
-    assert_eq!(summary_after_retry.latest_identity_present, Some(true));
-    assert!(!summary_after_retry.requires_recovery);
-
-    let third = coordinator
-        .repair_turn_checkpoint_tail_with_runtime(&config, session_id, &retry_runtime, None)
-        .await
-        .expect("finalized durable repair should stay noop");
-    assert_eq!(third.status().as_str(), "not_needed");
-    assert_eq!(third.reason(), TurnCheckpointTailRepairReason::NotNeeded);
-    assert_eq!(
-        retry_runtime
-            .compact_calls
-            .lock()
-            .expect("compact lock")
-            .len(),
-        1,
-        "finalized durable checkpoint must not trigger another compaction"
-    );
-
-    let _ = std::fs::remove_file(&db_path);
 }

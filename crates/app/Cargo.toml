@@ -6,14 +6,15 @@ license.workspace = true
 authors.workspace = true
 
 [features]
-default = ["channel-cli", "channel-telegram", "channel-feishu", "config-toml", "memory-sqlite", "tool-shell", "tool-file", "provider-openai", "provider-volcengine"]
+default = ["channel-cli", "channel-telegram", "channel-feishu", "config-toml", "memory-sqlite", "feishu-integration", "tool-shell", "tool-file", "provider-openai", "provider-volcengine"]
 channel-cli = []
 channel-telegram = []
-channel-feishu = ["dep:axum", "dep:aes", "dep:cbc"]
+channel-feishu = ["dep:axum", "dep:aes", "dep:cbc", "feishu-integration"]
 provider-openai = []
 provider-volcengine = []
 config-toml = ["dep:toml"]
 memory-sqlite = ["dep:rusqlite"]
+feishu-integration = ["dep:rusqlite"]
 tool-shell = []
 tool-file = []
 
@@ -21,6 +22,7 @@ tool-file = []
 loongclaw-contracts = { path = "../contracts" }
 loongclaw-kernel = { path = "../kernel" }
 async-trait.workspace = true
+chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml = { workspace = true, optional = true }
@@ -31,6 +33,7 @@ tar.workspace = true
 tokio.workspace = true
 base64.workspace = true
 time.workspace = true
+http-body = "1"
 rusqlite = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 aes = { version = "0.8", optional = true }

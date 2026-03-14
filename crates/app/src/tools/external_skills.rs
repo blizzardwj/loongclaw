@@ -1606,6 +1606,7 @@ mod tests {
                 install_root: None,
                 auto_expose_installed: true,
             },
+            ..ToolRuntimeConfig::default()
         }
     }
 

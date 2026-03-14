@@ -6,6 +6,7 @@ use std::{
 
 pub(super) const DEFAULT_CONFIG_FILE: &str = "config.toml";
 pub(super) const DEFAULT_SQLITE_FILE: &str = "memory.sqlite3";
+pub(super) const DEFAULT_FEISHU_SQLITE_FILE: &str = "feishu.sqlite3";
 
 pub(super) struct EnvPointerValidationHint<'a> {
     pub inline_field_path: &'a str,

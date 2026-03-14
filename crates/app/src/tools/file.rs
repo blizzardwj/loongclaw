@@ -116,6 +116,7 @@ pub(super) fn execute_file_write_tool_with_config(
     }
 }
 
+#[cfg(feature = "tool-file")]
 pub(super) fn resolve_safe_file_path_with_config(
     raw: &str,
     config: &super::runtime_config::ToolRuntimeConfig,
@@ -275,6 +276,7 @@ mod tests {
             shell_allowlist: Default::default(),
             file_root: Some(root),
             external_skills: Default::default(),
+            ..ToolRuntimeConfig::default()
         };
         let error =
             resolve_safe_file_path_with_config("secret-link", &config).expect_err("escape denied");
@@ -299,6 +301,7 @@ mod tests {
             shell_allowlist: Default::default(),
             file_root: Some(root),
             external_skills: Default::default(),
+            ..ToolRuntimeConfig::default()
         };
         let request = ToolCoreRequest {
             tool_name: "file.write".to_owned(),
@@ -325,6 +328,7 @@ mod tests {
             shell_allowlist: Default::default(),
             file_root: Some(root.clone()),
             external_skills: Default::default(),
+            ..ToolRuntimeConfig::default()
         };
         let request = ToolCoreRequest {
             tool_name: "file.write".to_owned(),

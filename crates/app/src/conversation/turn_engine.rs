@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::KernelContext;
 
+use super::ingress::{ConversationIngressContext, inject_internal_tool_ingress};
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProviderTurn {
     pub assistant_text: String,
@@ -339,6 +341,15 @@ impl TurnEngine {
         turn: &ProviderTurn,
         kernel_ctx: Option<&KernelContext>,
     ) -> TurnResult {
+        self.execute_turn_with_ingress(turn, kernel_ctx, None).await
+    }
+
+    pub async fn execute_turn_with_ingress(
+        &self,
+        turn: &ProviderTurn,
+        kernel_ctx: Option<&KernelContext>,
+        ingress: Option<&ConversationIngressContext>,
+    ) -> TurnResult {
         // No tool intents → just return the text
         if turn.tool_intents.is_empty() {
             return TurnResult::FinalText(turn.assistant_text.clone());
@@ -368,7 +379,11 @@ impl TurnEngine {
         for intent in &turn.tool_intents {
             let request = ToolCoreRequest {
                 tool_name: intent.tool_name.clone(),
-                payload: intent.args_json.clone(),
+                payload: inject_internal_tool_ingress(
+                    intent.tool_name.as_str(),
+                    intent.args_json.clone(),
+                    ingress,
+                ),
             };
             let caps = BTreeSet::from([Capability::InvokeTool]);
             match ctx
