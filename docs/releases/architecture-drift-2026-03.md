@@ -1,7 +1,7 @@
 # Architecture Drift Report 2026-03
 
 ## Summary
-- Generated at: 2026-03-14T11:06:46Z
+- Generated at: 2026-03-14T13:41:11Z
 - Report month: `2026-03`
 - Baseline report: none
 - Hotspots tracked: 4
@@ -14,7 +14,7 @@
 | spec_runtime | `crates/spec/src/spec_runtime.rs` | 2926 | 3600 | 674 | 47 | 65 | 18 | n/a | n/a | N/A | n/a |
 | spec_execution | `crates/spec/src/spec_execution.rs` | 1467 | 3700 | 2233 | 22 | 80 | 58 | n/a | n/a | N/A | n/a |
 | provider_mod | `crates/app/src/provider/mod.rs` | 234 | 1000 | 766 | 5 | 20 | 15 | n/a | n/a | N/A | n/a |
-| memory_mod | `crates/app/src/memory/mod.rs` | 645 | 650 | 5 | 14 | 16 | 2 | n/a | n/a | N/A | n/a |
+| memory_mod | `crates/app/src/memory/mod.rs` | 646 | 650 | 4 | 14 | 16 | 2 | n/a | n/a | N/A | n/a |
 
 ## Boundary Checks
 | Check | Status | Previous Status | Detail |
@@ -40,6 +40,6 @@
 <!-- arch-hotspot key=spec_runtime lines=2926 functions=47 -->
 <!-- arch-hotspot key=spec_execution lines=1467 functions=22 -->
 <!-- arch-hotspot key=provider_mod lines=234 functions=5 -->
-<!-- arch-hotspot key=memory_mod lines=645 functions=14 -->
+<!-- arch-hotspot key=memory_mod lines=646 functions=14 -->
 <!-- arch-boundary key=memory_literals status=PASS -->
 <!-- arch-boundary key=provider_mod_helper_definitions status=PASS -->
