@@ -10,7 +10,7 @@ use super::shared::{
 pub(crate) const MIN_MEMORY_SLIDING_WINDOW: usize = 1;
 pub(crate) const MAX_MEMORY_SLIDING_WINDOW: usize = 128;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolConfig {
     #[serde(default = "default_shell_allowlist")]
     pub shell_allowlist: Vec<String>,
@@ -18,7 +18,7 @@ pub struct ToolConfig {
     pub file_root: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExternalSkillsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -34,7 +34,7 @@ pub struct ExternalSkillsConfig {
     pub auto_expose_installed: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemoryConfig {
     #[serde(default)]
     pub backend: MemoryBackendKind,
