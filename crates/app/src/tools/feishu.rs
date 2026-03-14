@@ -2137,13 +2137,18 @@ fn execute_feishu_card_update_tool_with_config(
     let configured_account_id = context.configured_account_id.clone();
 
     if let Some(deferred_context_id) = deferred_context_id {
+        let cards::FeishuCardUpdateRequest {
+            token,
+            card,
+            open_ids,
+        } = update_request;
         let callback_token_use_count = enqueue_deferred_feishu_card_update(
             deferred_context_id.as_str(),
             DeferredFeishuCardUpdate {
                 configured_account_id,
-                token: update_request.token.clone(),
-                card: update_request.card.clone(),
-                open_ids: update_request.open_ids.clone(),
+                token,
+                card,
+                open_ids,
             },
         )?;
         return Ok(ok_outcome_without_principal(
@@ -2503,7 +2508,7 @@ fn load_feishu_tool_context(
     let configured_account_id = resolved.configured_account_id.clone();
     let configured_account_label = resolved.configured_account_label.clone();
     let account_id = resolved.account.id.clone();
-    let receive_id_type = resolved.receive_id_type.clone();
+    let receive_id_type = resolved.receive_id_type;
     let store = FeishuTokenStore::new(runtime.integration.resolved_sqlite_path());
 
     Ok(FeishuToolContext {

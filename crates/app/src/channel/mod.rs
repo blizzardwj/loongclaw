@@ -1,5 +1,6 @@
 #[cfg(feature = "channel-telegram")]
 use std::time::Duration;
+use std::{fmt, str::FromStr};
 #[cfg(any(feature = "channel-telegram", feature = "channel-feishu"))]
 use std::{
     future::Future,
@@ -11,6 +12,7 @@ use std::{
 
 #[cfg(any(feature = "channel-telegram", feature = "channel-feishu"))]
 use async_trait::async_trait;
+use serde::Serialize;
 #[cfg(any(feature = "channel-telegram", feature = "channel-feishu"))]
 use serde_json::Value;
 #[cfg(feature = "channel-telegram")]
@@ -44,9 +46,22 @@ mod runtime_state;
 mod telegram;
 
 pub use registry::{
-    ChannelCatalogEntry, ChannelCatalogOperation, ChannelOperationHealth, ChannelOperationStatus,
-    ChannelStatusSnapshot, channel_status_snapshots, list_channel_catalog,
-    normalize_channel_platform,
+    CHANNEL_OPERATION_SEND_ID, CHANNEL_OPERATION_SERVE_ID, ChannelCapability,
+    ChannelCatalogCommandFamilyDescriptor, ChannelCatalogEntry, ChannelCatalogImplementationStatus,
+    ChannelCatalogOperation, ChannelCatalogOperationAvailability,
+    ChannelCatalogOperationRequirement, ChannelCommandFamilyDescriptor, ChannelDoctorCheckSpec,
+    ChannelDoctorCheckTrigger, ChannelDoctorOperationSpec, ChannelInventory,
+    ChannelOperationDescriptor, ChannelOperationHealth, ChannelOperationStatus,
+    ChannelRuntimeCommandDescriptor, ChannelStatusSnapshot, ChannelSurface,
+    FEISHU_CATALOG_COMMAND_FAMILY_DESCRIPTOR, FEISHU_COMMAND_FAMILY_DESCRIPTOR,
+    FEISHU_RUNTIME_COMMAND_DESCRIPTOR, TELEGRAM_CATALOG_COMMAND_FAMILY_DESCRIPTOR,
+    TELEGRAM_COMMAND_FAMILY_DESCRIPTOR, TELEGRAM_RUNTIME_COMMAND_DESCRIPTOR,
+    catalog_only_channel_entries, channel_inventory, channel_status_snapshots,
+    list_channel_catalog, normalize_channel_catalog_id, normalize_channel_platform,
+    resolve_channel_catalog_command_family_descriptor, resolve_channel_catalog_entry,
+    resolve_channel_catalog_operation, resolve_channel_command_family_descriptor,
+    resolve_channel_doctor_operation_spec, resolve_channel_operation_descriptor,
+    resolve_channel_runtime_command_descriptor,
 };
 pub use runtime_state::ChannelOperationRuntime;
 use runtime_state::ChannelOperationRuntimeTracker;
@@ -229,7 +244,8 @@ impl ChannelSession {
 }
 
 #[cfg(any(feature = "channel-telegram", feature = "channel-feishu"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ChannelOutboundTargetKind {
     Conversation,
     MessageReply,
@@ -246,6 +262,30 @@ impl ChannelOutboundTargetKind {
         }
     }
 }
+
+impl fmt::Display for ChannelOutboundTargetKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ChannelOutboundTargetKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+        match normalized.as_str() {
+            "conversation" => Ok(Self::Conversation),
+            "message_reply" => Ok(Self::MessageReply),
+            "receive_id" => Ok(Self::ReceiveId),
+            _ => Err(format!(
+                "unsupported channel target kind `{value}`; expected conversation, message_reply, or receive_id"
+            )),
+        }
+    }
+}
+
+pub use self::ChannelOutboundTargetKind as ChannelCatalogTargetKind;
 
 #[cfg(any(feature = "channel-telegram", feature = "channel-feishu"))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -700,7 +740,7 @@ pub async fn run_telegram_channel(
         with_channel_serve_runtime(
             ChannelServeRuntimeSpec {
                 platform: ChannelPlatform::Telegram,
-                operation_id: "serve",
+                operation_id: CHANNEL_OPERATION_SERVE_ID,
                 account_id: runtime_account_id.as_str(),
                 account_label: runtime_account_label.as_str(),
             },
@@ -749,6 +789,49 @@ pub async fn run_telegram_channel(
             }
         )
         .await
+    }
+}
+
+#[allow(clippy::print_stdout)] // CLI output
+pub async fn run_telegram_send(
+    config_path: Option<&str>,
+    account_id: Option<&str>,
+    target: &str,
+    target_kind: ChannelOutboundTargetKind,
+    text: &str,
+) -> CliResult<()> {
+    if !cfg!(feature = "channel-telegram") {
+        return Err("telegram channel is disabled (enable feature `channel-telegram`)".to_owned());
+    }
+
+    #[cfg(not(feature = "channel-telegram"))]
+    {
+        let _ = (config_path, account_id, target, target_kind, text);
+        return Err("telegram channel is disabled (enable feature `channel-telegram`)".to_owned());
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    {
+        let context = load_telegram_command_context(config_path, account_id)?;
+        apply_runtime_env(&context.config);
+        context.emit_route_notice(ChannelPlatform::Telegram);
+        let token = context.resolved.bot_token().ok_or_else(|| {
+            "telegram bot token missing (set telegram.bot_token or env)".to_owned()
+        })?;
+        let adapter = telegram::TelegramAdapter::new(&context.resolved, token);
+        let outbound_target =
+            ChannelOutboundTarget::new(ChannelPlatform::Telegram, target_kind, target.to_owned());
+        adapter.send_text(&outbound_target, text).await?;
+
+        println!(
+            "telegram message sent (config={}, configured_account={}, account={}, selected_by_default={}, default_source={})",
+            context.resolved_path.display(),
+            context.resolved.configured_account_id,
+            context.resolved.account.label,
+            context.route.selected_by_default(),
+            context.route.default_account_source.as_str()
+        );
+        Ok(())
     }
 }
 
@@ -825,7 +908,7 @@ pub async fn run_feishu_channel(
         with_channel_serve_runtime(
             ChannelServeRuntimeSpec {
                 platform: ChannelPlatform::Feishu,
-                operation_id: "serve",
+                operation_id: CHANNEL_OPERATION_SERVE_ID,
                 account_id: runtime_account_id.as_str(),
                 account_label: runtime_account_label.as_str(),
             },
@@ -970,37 +1053,6 @@ fn normalized_feishu_callback_context(
 
 #[cfg(any(feature = "channel-telegram", feature = "channel-feishu"))]
 fn apply_runtime_env(config: &LoongClawConfig) {
-    crate::memory::runtime_config::apply_memory_runtime_env(&config.memory);
-    crate::process_env::set_var(
-        "LOONGCLAW_SHELL_ALLOWLIST",
-        config.tools.shell_allowlist.join(","),
-    );
-    crate::process_env::set_var(
-        "LOONGCLAW_FILE_ROOT",
-        config.tools.resolved_file_root().display().to_string(),
-    );
-    crate::process_env::set_var(
-        "LOONGCLAW_EXTERNAL_SKILLS_ENABLED",
-        config.external_skills.enabled.to_string(),
-    );
-    crate::process_env::set_var(
-        "LOONGCLAW_EXTERNAL_SKILLS_REQUIRE_DOWNLOAD_APPROVAL",
-        config.external_skills.require_download_approval.to_string(),
-    );
-    crate::process_env::set_var(
-        "LOONGCLAW_EXTERNAL_SKILLS_ALLOWED_DOMAINS",
-        config
-            .external_skills
-            .normalized_allowed_domains()
-            .join(","),
-    );
-    crate::process_env::set_var(
-        "LOONGCLAW_EXTERNAL_SKILLS_BLOCKED_DOMAINS",
-        config
-            .external_skills
-            .normalized_blocked_domains()
-            .join(","),
-    );
     // Populate the typed tool runtime config so executors never hit env vars
     // on the hot path.  Ignore the error if already initialised.
     let tool_rt = crate::tools::runtime_config::ToolRuntimeConfig {
@@ -1024,6 +1076,8 @@ fn apply_runtime_env(config: &LoongClawConfig) {
                 .normalized_blocked_domains()
                 .into_iter()
                 .collect(),
+            install_root: config.external_skills.resolved_install_root(),
+            auto_expose_installed: config.external_skills.auto_expose_installed,
         },
         #[cfg(feature = "feishu-integration")]
         feishu: crate::tools::runtime_config::FeishuToolRuntimeConfig::from_loongclaw_config(
@@ -1700,7 +1754,7 @@ mod tests {
         let runtime_dir_for_body = runtime_dir.clone();
         let operation = ChannelServeRuntimeSpec {
             platform: ChannelPlatform::Telegram,
-            operation_id: "serve",
+            operation_id: CHANNEL_OPERATION_SERVE_ID,
             account_id: "bot_123456",
             account_label: "bot:123456",
         };
@@ -1771,7 +1825,7 @@ mod tests {
             9191,
             ChannelServeRuntimeSpec {
                 platform: ChannelPlatform::Telegram,
-                operation_id: "serve",
+                operation_id: CHANNEL_OPERATION_SERVE_ID,
                 account_id: "bot_123456",
                 account_label: "bot:123456",
             },
@@ -1810,7 +1864,7 @@ mod tests {
             9191,
             ChannelServeRuntimeSpec {
                 platform: ChannelPlatform::Telegram,
-                operation_id: "serve",
+                operation_id: CHANNEL_OPERATION_SERVE_ID,
                 account_id: "bot_123456",
                 account_label: "bot:123456",
             },

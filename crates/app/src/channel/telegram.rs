@@ -159,7 +159,10 @@ impl ChannelAdapter for TelegramAdapter {
         }
         let text = match message {
             ChannelOutboundMessage::Text(text) => text,
-            other => {
+            other @ ChannelOutboundMessage::MarkdownCard(_)
+            | other @ ChannelOutboundMessage::Post(_)
+            | other @ ChannelOutboundMessage::Image { .. }
+            | other @ ChannelOutboundMessage::File { .. } => {
                 return Err(format!(
                     "telegram adapter only supports plain text outbound messages, got {other:?}"
                 ));

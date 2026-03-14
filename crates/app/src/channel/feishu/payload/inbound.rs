@@ -155,7 +155,7 @@ pub(in crate::channel::feishu) fn parse_feishu_webhook_payload(
 
     Ok(FeishuWebhookAction::Inbound(FeishuInboundEvent {
         event_id,
-        message_id: message_id.clone(),
+        message_id,
         root_id,
         parent_id,
         session: {
@@ -1255,7 +1255,10 @@ fn normalize_feishu_content(content: &Value) -> Option<Value> {
             Some(Value::String(trimmed.to_owned()))
         }
         Value::Null => None,
-        other => Some(other.clone()),
+        other @ Value::Bool(_)
+        | other @ Value::Number(_)
+        | other @ Value::Array(_)
+        | other @ Value::Object(_) => Some(other.clone()),
     }
 }
 
@@ -1339,7 +1342,7 @@ fn collect_post_delivery_resources_into(
                 collect_post_delivery_resources_into(item, resources);
             }
         }
-        _ => {}
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
@@ -1360,7 +1363,7 @@ fn find_first_string_field(value: &Value, field: &str) -> Option<String> {
         Value::Array(items) => items
             .iter()
             .find_map(|value| find_first_string_field(value, field)),
-        _ => None,
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => None,
     }
 }
 
@@ -1376,7 +1379,7 @@ fn find_first_scalar_field_string(value: &Value, field: &str) -> Option<String> 
         Value::Array(items) => items
             .iter()
             .find_map(|value| find_first_scalar_field_string(value, field)),
-        _ => None,
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => None,
     }
 }
 
@@ -1392,7 +1395,7 @@ fn find_first_string_list_field(value: &Value, field: &str) -> Option<Vec<String
         Value::Array(items) => items
             .iter()
             .find_map(|value| find_first_string_list_field(value, field)),
-        _ => None,
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => None,
     }
 }
 
@@ -1408,7 +1411,7 @@ fn value_to_scalar_string(value: &Value) -> Option<String> {
         }
         Value::Number(number) => Some(number.to_string()),
         Value::Bool(flag) => Some(flag.to_string()),
-        _ => None,
+        Value::Null | Value::Array(_) | Value::Object(_) => None,
     }
 }
 
@@ -1422,7 +1425,9 @@ fn value_to_string_list(value: &Value) -> Option<Vec<String>> {
                 Some(values)
             }
         }
-        _ => None,
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) | Value::Object(_) => {
+            None
+        }
     }
 }
 
@@ -1453,7 +1458,7 @@ fn collect_named_string_fields_into(value: &Value, field: &str, values: &mut Vec
                 collect_named_string_fields_into(value, field, values);
             }
         }
-        _ => {}
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 

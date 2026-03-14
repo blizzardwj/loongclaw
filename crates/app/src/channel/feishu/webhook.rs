@@ -843,6 +843,8 @@ mod tests {
                     .normalized_blocked_domains()
                     .into_iter()
                     .collect(),
+                install_root: config.external_skills.resolved_install_root(),
+                auto_expose_installed: config.external_skills.auto_expose_installed,
             },
             #[cfg(feature = "feishu-integration")]
             feishu: crate::tools::runtime_config::FeishuToolRuntimeConfig::from_loongclaw_config(

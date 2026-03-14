@@ -28,7 +28,7 @@ fn build_system_message_with_tool_runtime_config(
     }
     let system_prompt = config.cli.resolved_system_prompt();
     let system = system_prompt.trim();
-    let snapshot = tools::capability_snapshot_with_config(tool_runtime_config);
+    let snapshot = tools::capability_snapshot_with_config(Some(tool_runtime_config));
     let content = if system.is_empty() {
         snapshot
     } else {

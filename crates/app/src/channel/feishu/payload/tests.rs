@@ -44,6 +44,41 @@ fn parse_feishu_resource_inventory(summary: &Value) -> Vec<Value> {
         .unwrap_or_else(|| panic!("missing resource inventory"))
 }
 
+fn expect_url_verification(action: FeishuWebhookAction) -> String {
+    match action {
+        FeishuWebhookAction::UrlVerification { challenge } => challenge,
+        FeishuWebhookAction::Ignore => panic!("unexpected ignore action"),
+        FeishuWebhookAction::Inbound(event) => panic!("unexpected inbound action: {event:?}"),
+        FeishuWebhookAction::CardCallback(event) => {
+            panic!("unexpected card callback action: {event:?}")
+        }
+    }
+}
+
+fn expect_inbound(action: FeishuWebhookAction) -> FeishuInboundEvent {
+    match action {
+        FeishuWebhookAction::Inbound(event) => event,
+        FeishuWebhookAction::UrlVerification { challenge } => {
+            panic!("unexpected url verification action: {challenge}")
+        }
+        FeishuWebhookAction::Ignore => panic!("unexpected ignore action"),
+        FeishuWebhookAction::CardCallback(event) => {
+            panic!("unexpected card callback action: {event:?}")
+        }
+    }
+}
+
+fn expect_card_callback(action: FeishuWebhookAction) -> FeishuCardCallbackEvent {
+    match action {
+        FeishuWebhookAction::CardCallback(event) => event,
+        FeishuWebhookAction::UrlVerification { challenge } => {
+            panic!("unexpected url verification action: {challenge}")
+        }
+        FeishuWebhookAction::Ignore => panic!("unexpected ignore action"),
+        FeishuWebhookAction::Inbound(event) => panic!("unexpected inbound action: {event:?}"),
+    }
+}
+
 #[test]
 fn feishu_url_verification_payload_parses() {
     let payload = json!({
@@ -62,10 +97,8 @@ fn feishu_url_verification_payload_parses() {
     )
     .expect("parse feishu url verification");
 
-    match action {
-        FeishuWebhookAction::UrlVerification { challenge } => assert_eq!(challenge, "abc"),
-        _ => panic!("unexpected action"),
-    }
+    let challenge = expect_url_verification(action);
+    assert_eq!(challenge, "abc");
 }
 
 #[test]
@@ -105,29 +138,24 @@ fn feishu_message_event_parses_text_payload() {
     )
     .expect("parse feishu event");
 
-    match action {
-        FeishuWebhookAction::Inbound(event) => {
-            assert_eq!(event.event_id, "evt_1");
-            assert_eq!(event.session.configured_account_id.as_deref(), Some("work"));
-            assert_eq!(
-                event.session.session_key(),
-                "feishu:cfg=work:feishu_cli_a1b2c3:oc_123:ou_sender_1:om_root_1"
-            );
-            assert_eq!(
-                event.reply_target,
-                ChannelOutboundTarget::feishu_message_reply("om_123")
-                    .with_feishu_reply_in_thread(true)
-            );
-            assert_eq!(event.reply_target.platform, ChannelPlatform::Feishu);
-            assert_eq!(
-                event.reply_target.kind,
-                ChannelOutboundTargetKind::MessageReply
-            );
-            assert_eq!(event.reply_target.feishu_reply_in_thread(), Some(true));
-            assert_eq!(event.text, "hello loongclaw");
-        }
-        _ => panic!("unexpected action"),
-    }
+    let event = expect_inbound(action);
+    assert_eq!(event.event_id, "evt_1");
+    assert_eq!(event.session.configured_account_id.as_deref(), Some("work"));
+    assert_eq!(
+        event.session.session_key(),
+        "feishu:cfg=work:feishu_cli_a1b2c3:oc_123:ou_sender_1:om_root_1"
+    );
+    assert_eq!(
+        event.reply_target,
+        ChannelOutboundTarget::feishu_message_reply("om_123").with_feishu_reply_in_thread(true)
+    );
+    assert_eq!(event.reply_target.platform, ChannelPlatform::Feishu);
+    assert_eq!(
+        event.reply_target.kind,
+        ChannelOutboundTargetKind::MessageReply
+    );
+    assert_eq!(event.reply_target.feishu_reply_in_thread(), Some(true));
+    assert_eq!(event.text, "hello loongclaw");
 }
 
 #[test]
@@ -169,10 +197,7 @@ fn feishu_message_event_uses_thread_id_and_sender_open_id_when_present() {
     )
     .expect("parse feishu event");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
 
     assert_eq!(
         event.session.session_key(),
@@ -225,10 +250,7 @@ fn feishu_message_without_sender_open_id_keeps_principal_empty() {
     )
     .expect("parse feishu event");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
 
     assert_eq!(event.session.thread_id.as_deref(), Some("om_root_1"));
     assert!(event.session.participant_id.is_none());
@@ -282,58 +304,54 @@ fn feishu_card_callback_v2_payload_is_not_ignored() {
     )
     .expect("parse v2 callback payload");
 
-    match action {
-        FeishuWebhookAction::CardCallback(event) => {
-            assert_eq!(event.version, FeishuCardCallbackVersion::V2);
-            assert_eq!(event.event_id, "evt_card_v2_1");
-            assert_eq!(event.callback_token.as_deref(), Some("c-123"));
-            assert_eq!(event.action.tag, "button");
-            assert_eq!(event.action.name.as_deref(), Some("approve_request"));
-            assert_eq!(event.action.value, Some(json!({"ticket_id": "T-100"})));
-            assert_eq!(event.action.form_value, Some(json!({"comment": "ship it"})));
-            assert_eq!(
-                event.context.open_message_id.as_deref(),
-                Some("om_callback_1")
-            );
-            assert_eq!(event.context.open_chat_id.as_deref(), Some("oc_123"));
-            assert_eq!(
-                event.session.session_key(),
-                "feishu:feishu_main:oc_123:ou_operator_1:om_callback_1"
-            );
-            assert_eq!(
-                event.principal.as_ref().map(|value| value.open_id.as_str()),
-                Some("ou_operator_1")
-            );
+    let event = expect_card_callback(action);
+    assert_eq!(event.version, FeishuCardCallbackVersion::V2);
+    assert_eq!(event.event_id, "evt_card_v2_1");
+    assert_eq!(event.callback_token.as_deref(), Some("c-123"));
+    assert_eq!(event.action.tag, "button");
+    assert_eq!(event.action.name.as_deref(), Some("approve_request"));
+    assert_eq!(event.action.value, Some(json!({"ticket_id": "T-100"})));
+    assert_eq!(event.action.form_value, Some(json!({"comment": "ship it"})));
+    assert_eq!(
+        event.context.open_message_id.as_deref(),
+        Some("om_callback_1")
+    );
+    assert_eq!(event.context.open_chat_id.as_deref(), Some("oc_123"));
+    assert_eq!(
+        event.session.session_key(),
+        "feishu:feishu_main:oc_123:ou_operator_1:om_callback_1"
+    );
+    assert_eq!(
+        event.principal.as_ref().map(|value| value.open_id.as_str()),
+        Some("ou_operator_1")
+    );
 
-            let summary = parse_feishu_card_callback_summary(&event.text);
-            assert_eq!(summary["callback_version"], "v2");
-            assert_eq!(summary["tag"], "button");
-            assert_eq!(summary["name"], "approve_request");
-            assert_eq!(summary["operator_open_id"], "ou_operator_1");
-            assert_eq!(summary["open_message_id"], "om_callback_1");
-            assert_eq!(summary["open_chat_id"], "oc_123");
-            assert!(summary["card_update_hint"].as_str().is_some_and(|hint| {
-                hint.contains("shared=true")
-                    && hint.contains("open_ids")
-                    && hint.contains("markdown")
-                    && hint.contains("30 minutes")
-                    && hint.contains("twice")
-            }));
-            assert!(
-                summary["callback_response_hint"]
-                    .as_str()
-                    .is_some_and(|hint| {
-                        hint.contains("[feishu_callback_response]")
-                            && hint.contains("\"mode\":\"toast\"")
-                            && hint.contains("\"mode\":\"card\"")
-                            && hint.contains("\"card\"")
-                            && hint.contains("\"markdown\"")
-                            && hint.contains("\"kind\":\"success|info|warning|error\"")
-                    })
-            );
-        }
-        _ => panic!("unexpected action"),
-    }
+    let summary = parse_feishu_card_callback_summary(&event.text);
+    assert_eq!(summary["callback_version"], "v2");
+    assert_eq!(summary["tag"], "button");
+    assert_eq!(summary["name"], "approve_request");
+    assert_eq!(summary["operator_open_id"], "ou_operator_1");
+    assert_eq!(summary["open_message_id"], "om_callback_1");
+    assert_eq!(summary["open_chat_id"], "oc_123");
+    assert!(summary["card_update_hint"].as_str().is_some_and(|hint| {
+        hint.contains("shared=true")
+            && hint.contains("open_ids")
+            && hint.contains("markdown")
+            && hint.contains("30 minutes")
+            && hint.contains("twice")
+    }));
+    assert!(
+        summary["callback_response_hint"]
+            .as_str()
+            .is_some_and(|hint| {
+                hint.contains("[feishu_callback_response]")
+                    && hint.contains("\"mode\":\"toast\"")
+                    && hint.contains("\"mode\":\"card\"")
+                    && hint.contains("\"card\"")
+                    && hint.contains("\"markdown\"")
+                    && hint.contains("\"kind\":\"success|info|warning|error\"")
+            })
+    );
 }
 
 #[test]
@@ -366,45 +384,41 @@ fn feishu_card_callback_v1_payload_is_not_ignored() {
     )
     .expect("parse legacy callback payload");
 
-    match action {
-        FeishuWebhookAction::CardCallback(event) => {
-            assert_eq!(event.version, FeishuCardCallbackVersion::V1);
-            assert!(
-                event
-                    .event_id
-                    .starts_with("card_callback:v1:om_callback_legacy:")
-            );
-            assert!(event.callback_token.is_none());
-            assert_eq!(event.action.tag, "button");
-            assert_eq!(event.action.name.as_deref(), Some("reject_request"));
-            assert_eq!(event.action.value, Some(json!({"ticket_id": "T-101"})));
-            assert_eq!(
-                event.context.open_message_id.as_deref(),
-                Some("om_callback_legacy")
-            );
-            assert_eq!(event.context.open_chat_id.as_deref(), Some("oc_123"));
-            assert_eq!(
-                event.session.session_key(),
-                "feishu:feishu_main:oc_123:ou_operator_legacy:om_callback_legacy"
-            );
-            assert_eq!(
-                event
-                    .principal
-                    .as_ref()
-                    .and_then(|value| value.tenant_key.as_deref()),
-                Some("tenant_1")
-            );
+    let event = expect_card_callback(action);
+    assert_eq!(event.version, FeishuCardCallbackVersion::V1);
+    assert!(
+        event
+            .event_id
+            .starts_with("card_callback:v1:om_callback_legacy:")
+    );
+    assert!(event.callback_token.is_none());
+    assert_eq!(event.action.tag, "button");
+    assert_eq!(event.action.name.as_deref(), Some("reject_request"));
+    assert_eq!(event.action.value, Some(json!({"ticket_id": "T-101"})));
+    assert_eq!(
+        event.context.open_message_id.as_deref(),
+        Some("om_callback_legacy")
+    );
+    assert_eq!(event.context.open_chat_id.as_deref(), Some("oc_123"));
+    assert_eq!(
+        event.session.session_key(),
+        "feishu:feishu_main:oc_123:ou_operator_legacy:om_callback_legacy"
+    );
+    assert_eq!(
+        event
+            .principal
+            .as_ref()
+            .and_then(|value| value.tenant_key.as_deref()),
+        Some("tenant_1")
+    );
 
-            let summary = parse_feishu_card_callback_summary(&event.text);
-            assert_eq!(summary["callback_version"], "v1");
-            assert_eq!(summary["tag"], "button");
-            assert_eq!(summary["name"], "reject_request");
-            assert_eq!(summary["operator_open_id"], "ou_operator_legacy");
-            assert_eq!(summary["open_message_id"], "om_callback_legacy");
-            assert_eq!(summary["open_chat_id"], "oc_123");
-        }
-        _ => panic!("unexpected action"),
-    }
+    let summary = parse_feishu_card_callback_summary(&event.text);
+    assert_eq!(summary["callback_version"], "v1");
+    assert_eq!(summary["tag"], "button");
+    assert_eq!(summary["name"], "reject_request");
+    assert_eq!(summary["operator_open_id"], "ou_operator_legacy");
+    assert_eq!(summary["open_message_id"], "om_callback_legacy");
+    assert_eq!(summary["open_chat_id"], "oc_123");
 }
 
 #[test]
@@ -466,10 +480,7 @@ fn feishu_image_message_event_is_preserved_as_structured_text() {
     )
     .expect("image payload should parse");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
     assert!(event.text.contains("[feishu_inbound_message]"));
     assert!(event.text.contains("\"message_type\":\"image\""));
     assert!(event.text.contains("\"image_key\":\"img_v2_123\""));
@@ -527,10 +538,7 @@ fn feishu_file_message_event_is_preserved_as_structured_text() {
     )
     .expect("file payload should parse");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
     assert!(event.text.contains("[feishu_inbound_message]"));
     assert!(event.text.contains("\"message_type\":\"file\""));
     assert!(event.text.contains("\"file_key\":\"file_v2_123\""));
@@ -584,10 +592,7 @@ fn feishu_post_message_event_is_preserved_as_structured_text() {
     )
     .expect("post payload should parse");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
     assert!(event.text.contains("[feishu_inbound_message]"));
     assert!(event.text.contains("\"message_type\":\"post\""));
     assert!(event.text.contains("\"title\":\"Status update\""));
@@ -712,10 +717,7 @@ fn feishu_audio_message_event_is_preserved_as_structured_text() {
     )
     .expect("audio payload should parse");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
     assert!(event.text.contains("[feishu_inbound_message]"));
     assert!(event.text.contains("\"message_type\":\"audio\""));
     assert!(event.text.contains("\"file_key\":\"file_audio_v2_123\""));
@@ -773,10 +775,7 @@ fn feishu_media_message_event_is_preserved_as_structured_text() {
     )
     .expect("media payload should parse");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
     assert!(event.text.contains("[feishu_inbound_message]"));
     assert!(event.text.contains("\"message_type\":\"media\""));
     assert!(event.text.contains("\"file_key\":\"file_media_v2_123\""));
@@ -893,10 +892,7 @@ fn feishu_folder_message_event_is_preserved_as_structured_text_without_resources
     )
     .expect("folder payload should parse");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
     assert!(event.text.contains("[feishu_inbound_message]"));
     assert!(event.text.contains("\"message_type\":\"folder\""));
     assert!(event.text.contains("\"file_key\":\"fld_v2_123\""));
@@ -935,10 +931,7 @@ fn feishu_location_message_event_is_preserved_as_structured_text_without_resourc
     )
     .expect("location payload should parse");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
     assert!(event.text.contains("[feishu_inbound_message]"));
     assert!(event.text.contains("\"message_type\":\"location\""));
     assert!(event.text.contains("\"name\":\"Shanghai Tower\""));
@@ -981,10 +974,7 @@ fn feishu_interactive_message_event_extracts_high_signal_summary_fields() {
     )
     .expect("interactive payload should parse");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
     let summary = parse_feishu_inbound_summary(event.text.as_str());
     assert_eq!(summary["message_type"], "interactive");
     assert_eq!(summary["type"], "template");
@@ -1028,10 +1018,7 @@ fn feishu_share_chat_message_event_extracts_high_signal_summary_fields() {
     )
     .expect("share_chat payload should parse");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
     let summary = parse_feishu_inbound_summary(event.text.as_str());
     assert_eq!(summary["message_type"], "share_chat");
     assert_eq!(summary["chat_id"], "oc_shared_123");
@@ -1074,10 +1061,7 @@ fn feishu_share_user_message_event_extracts_high_signal_summary_fields() {
     )
     .expect("share_user payload should parse");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
     let summary = parse_feishu_inbound_summary(event.text.as_str());
     assert_eq!(summary["message_type"], "share_user");
     assert_eq!(summary["user_id"], "ou_user_123");
@@ -1119,10 +1103,7 @@ fn feishu_calendar_message_event_extracts_high_signal_summary_fields() {
     )
     .expect("calendar payload should parse");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
     let summary = parse_feishu_inbound_summary(event.text.as_str());
     assert_eq!(summary["message_type"], "calendar");
     assert_eq!(summary["event_id"], "evt_cal_123");
@@ -1166,10 +1147,7 @@ fn feishu_share_calendar_event_message_event_extracts_calendar_variant_summary_f
     )
     .expect("share calendar payload should parse");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
     let summary = parse_feishu_inbound_summary(event.text.as_str());
     assert_eq!(summary["message_type"], "share_calendar_event");
     assert_eq!(summary["start_time"], "1608265395000");
@@ -1212,10 +1190,7 @@ fn feishu_general_calendar_message_event_extracts_calendar_variant_summary_field
     )
     .expect("general calendar payload should parse");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
     let summary = parse_feishu_inbound_summary(event.text.as_str());
     assert_eq!(summary["message_type"], "general_calendar");
     assert_eq!(summary["start_time"], "1608265395000");
@@ -1258,10 +1233,7 @@ fn feishu_system_message_event_extracts_high_signal_summary_fields() {
     )
     .expect("system payload should parse");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
     let summary = parse_feishu_inbound_summary(event.text.as_str());
     assert_eq!(summary["message_type"], "system");
     assert_eq!(
@@ -1307,10 +1279,7 @@ fn feishu_video_chat_message_event_extracts_high_signal_summary_fields() {
     )
     .expect("video chat payload should parse");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
     let summary = parse_feishu_inbound_summary(event.text.as_str());
     assert_eq!(summary["message_type"], "video_chat");
     assert_eq!(summary["topic"], "Video call message");
@@ -1352,10 +1321,7 @@ fn feishu_todo_message_event_extracts_high_signal_summary_fields() {
     )
     .expect("todo payload should parse");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
     let summary = parse_feishu_inbound_summary(event.text.as_str());
     assert_eq!(summary["message_type"], "todo");
     assert_eq!(summary["task_id"], "acd096a5-a157-4b9d-80e2-5b317456f005");
@@ -1399,10 +1365,7 @@ fn feishu_vote_message_event_extracts_high_signal_summary_fields() {
     )
     .expect("vote payload should parse");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
     let summary = parse_feishu_inbound_summary(event.text.as_str());
     assert_eq!(summary["message_type"], "vote");
     assert_eq!(summary["topic"], "vote test");
@@ -1447,10 +1410,7 @@ fn feishu_merge_forward_message_event_extracts_high_signal_summary_fields() {
     )
     .expect("merge forward payload should parse");
 
-    let event = match action {
-        FeishuWebhookAction::Inbound(event) => event,
-        _ => panic!("unexpected action"),
-    };
+    let event = expect_inbound(action);
     let summary = parse_feishu_inbound_summary(event.text.as_str());
     assert_eq!(summary["message_type"], "merge_forward");
     assert_eq!(summary["merged_content"], "Merged and Forwarded Message");
@@ -1554,23 +1514,18 @@ fn feishu_encrypted_payload_parses_with_encrypt_key() {
     )
     .expect("parse encrypted payload");
 
-    match parsed {
-        FeishuWebhookAction::Inbound(event) => {
-            assert_eq!(event.event_id, "evt_encrypted_1");
-            assert_eq!(
-                event.session.session_key(),
-                "feishu:feishu_cli_a1b2c3:oc_encrypt:ou_sender_encrypt:om_thread_encrypt"
-            );
-            assert_eq!(
-                event.reply_target,
-                ChannelOutboundTarget::feishu_message_reply("om_encrypt")
-                    .with_feishu_reply_in_thread(true)
-            );
-            assert_eq!(event.reply_target.feishu_reply_in_thread(), Some(true));
-            assert_eq!(event.text, "encrypted hello");
-        }
-        _ => panic!("unexpected action"),
-    }
+    let event = expect_inbound(parsed);
+    assert_eq!(event.event_id, "evt_encrypted_1");
+    assert_eq!(
+        event.session.session_key(),
+        "feishu:feishu_cli_a1b2c3:oc_encrypt:ou_sender_encrypt:om_thread_encrypt"
+    );
+    assert_eq!(
+        event.reply_target,
+        ChannelOutboundTarget::feishu_message_reply("om_encrypt").with_feishu_reply_in_thread(true)
+    );
+    assert_eq!(event.reply_target.feishu_reply_in_thread(), Some(true));
+    assert_eq!(event.text, "encrypted hello");
 }
 
 #[test]

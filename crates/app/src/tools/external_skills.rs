@@ -1575,6 +1575,8 @@ mod tests {
                 install_root: None,
                 auto_expose_installed: true,
             },
+            #[cfg(feature = "feishu-integration")]
+            feishu: None,
         }
     }
 
