@@ -36,7 +36,8 @@ pub(crate) use runtime::{normalize_dispatch_account_id, normalize_dispatch_chann
 pub use shared::expand_path;
 #[allow(unused_imports)]
 pub use tools_memory::{
-    ExternalSkillsConfig, MemoryBackendKind, MemoryConfig, MemoryMode, MemoryProfile, ToolConfig,
+    ExternalSkillsConfig, MemoryBackendKind, MemoryConfig, MemoryMode, MemoryProfile,
+    MemorySystemKind, ToolConfig,
 };
 
 #[cfg(test)]
@@ -1595,6 +1596,17 @@ context_engine = " Legacy "
             parsed.conversation.context_engine_id().as_deref(),
             Some("legacy")
         );
+    }
+
+    #[test]
+    #[cfg(feature = "config-toml")]
+    fn memory_system_field_parses_and_normalizes() {
+        let raw = r#"
+[memory]
+system = " Builtin "
+"#;
+        let parsed = toml::from_str::<LoongClawConfig>(raw).expect("parse memory.system");
+        assert_eq!(parsed.memory.resolved_system().as_str(), "builtin");
     }
 
     #[test]
